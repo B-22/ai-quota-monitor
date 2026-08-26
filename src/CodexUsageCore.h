@@ -46,6 +46,8 @@ struct ResetRadarSnapshot {
     int confidencePercent = -1;
     long long updatedAtUnixSeconds = 0;
     long long openedAtUnixSeconds = 0;
+    long long closedAtUnixSeconds = 0;
+    long long probabilityUpdatedAtUnixSeconds = 0;
     long long checkedAtUnixSeconds = 0;
     long long nextScheduledAtUnixSeconds = 0;
     long long latestResetAtUnixSeconds = 0;
@@ -74,8 +76,22 @@ enum class FreshnessLevel {
     Stale,
 };
 
+// Trims a taskbar tooltip to the host ceiling, on a line boundary.
+//
+// TrafficMonitor refuses a tooltip longer than roughly 810 characters:
+// it pops a "遇到不适当的参数" message box on the first refresh that goes
+// over, and nothing lands in error.log. Cutting mid-line would leave a
+// half-written number, which reads as broken data rather than as a
+// truncation, so the cut lands on a newline and says what it did.
+//
+// The result never exceeds maxChars.
+std::wstring TruncateTooltip(const std::wstring& text, size_t maxChars);
+
 std::wstring Utf8ToWide(const std::string& input);
 std::wstring FormatIsoDateAsMonthDay(const std::string& text);
+std::string AdvanceExpiryToFuture(
+    const std::string& anchorDate, const std::string& cycle,
+    int todayYear, int todayMonth, int todayDay);
 UsageSnapshot ParseUsageJson(const std::string& jsonText, std::wstring* errorMessage);
 ResetCreditsSnapshot ParseResetCreditsJson(const std::string& jsonText, std::wstring* errorMessage);
 ResetRadarSnapshot ParseResetRadarSummaryJson(const std::string& jsonText, std::wstring* errorMessage);
@@ -89,7 +105,7 @@ ResetRadarSnapshot MergeResetRadarSnapshots(
     const ResetRadarSnapshot& forecast,
     long long nowUnixSeconds,
     long long maximumSignalAgeSeconds = 12 * 60 * 60);
-ResetRadarSnapshot MergeResetRadarSnapshots(
+ResetRadarSnapshot MergeResetRadarSnapshotsWithRunway(
     const ResetRadarSnapshot& runway,
     const ResetRadarSnapshot& summary,
     const ResetRadarSnapshot& forecast,

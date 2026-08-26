@@ -18,6 +18,28 @@ std::wstring Trim(const std::wstring& value) {
     return first < last ? std::wstring(first, last) : std::wstring();
 }
 
+std::wstring NormalizeNamedProxy(const std::wstring& value) {
+    std::wstring normalized = Trim(value);
+    const auto startsWithIgnoreCase = [&](const wchar_t* prefix) {
+        const size_t length = wcslen(prefix);
+        return normalized.size() >= length
+            && std::equal(
+                prefix, prefix + length, normalized.begin(),
+                [](wchar_t left, wchar_t right) {
+                    return std::towlower(left) == std::towlower(right);
+                });
+    };
+    if (startsWithIgnoreCase(L"http://")) {
+        normalized.erase(0, 7);
+    } else if (startsWithIgnoreCase(L"https://")) {
+        normalized.erase(0, 8);
+    }
+    while (!normalized.empty() && normalized.back() == L'/') {
+        normalized.pop_back();
+    }
+    return normalized;
+}
+
 std::vector<std::wstring> SplitIpList(const std::wstring& value) {
     std::vector<std::wstring> result;
     std::wstring token;
@@ -84,7 +106,10 @@ ProxyConfig DetectProxy(const std::wstring& explicitProxy, bool requireProxy,
                         const std::wstring& allowedExitIps,
                         const std::wstring& exitIpCheckUrl) {
     ProxyConfig config;
-    config.explicitProxy = Trim(explicitProxy);
+    // WinHttpOpen(WINHTTP_ACCESS_TYPE_NAMED_PROXY) expects a proxy name such
+    // as host:port (or a WinHTTP protocol map), not a URL. Accept the common
+    // http://host:port form used by browsers and normalize it once here.
+    config.explicitProxy = NormalizeNamedProxy(explicitProxy);
     config.requireProxy = requireProxy;
     config.allowedExitIps = SplitIpList(allowedExitIps);
     config.exitIpCheckUrl = Trim(exitIpCheckUrl);
@@ -316,7 +341,8 @@ bool VerifyExitIp(const ProxyConfig& config, const wchar_t* targetHost,
 
 HINTERNET OpenHttpSession(const ProxyConfig& config, const wchar_t* userAgent,
                           const wchar_t* targetHost,
-                          std::wstring* errorMessage) {
+                          std::wstring* errorMessage,
+                          bool verifyExitIp) {
     if (errorMessage) errorMessage->clear();
 
     if (config.requireProxy && !config.proxyActive
@@ -326,10 +352,12 @@ HINTERNET OpenHttpSession(const ProxyConfig& config, const wchar_t* userAgent,
         return nullptr;
     }
 
-    std::wstring observedIp;
-    if (!VerifyExitIp(config, targetHost, &observedIp, errorMessage)) {
-        SetLastError(ERROR_ACCESS_DISABLED_BY_POLICY);
-        return nullptr;
+    if (verifyExitIp) {
+        std::wstring observedIp;
+        if (!VerifyExitIp(config, targetHost, &observedIp, errorMessage)) {
+            SetLastError(ERROR_ACCESS_DISABLED_BY_POLICY);
+            return nullptr;
+        }
     }
 
     HINTERNET session = OpenRawSession(config, userAgent);

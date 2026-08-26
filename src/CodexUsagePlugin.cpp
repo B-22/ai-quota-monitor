@@ -1,10 +1,15 @@
 #include "CodexUsageFetcher.h"
 #include "ClaudeUsageFetcher.h"
+#include "ClaudeUsageExport.h"
 #include "AntigravityUsageFetcher.h"
 #include "KiroCreditsFetcher.h"
+#include "OpenRouterUsageFetcher.h"
+#include "OpenCodeGoUsageFetcher.h"
 #include "CodexUsageVersion.h"
 #include "DashboardRenderer.h"
 #include "ProxyHelper.h"
+#include "AgentLightItems.h"
+#include "AgentStatusWatcher.h"
 
 #include "PluginInterface.h"
 
@@ -66,6 +71,10 @@ constexpr float kProviderFont = 6.5f;
 constexpr float kInfoLabelFont = 8.0f;
 constexpr float kInfoValueFont = 11.0f;
 constexpr float kInfoSubFont = 6.5f;
+constexpr float kResetRadarIndicatorOffsetX = 2.0f;
+constexpr float kResetRadarIndicatorGap = 1.0f;
+constexpr float kResetRadarIndicatorWidth = 17.0f;
+constexpr float kResetRadarIndicatorHeight = 22.0f;
 constexpr float kRingStrokeRatio = 2.2f / 28.0f;
 constexpr float kNumberRatio = 0.45f;     // ring number vs. ring box
 constexpr float kBottomInset = 1.0f;
@@ -289,6 +298,28 @@ std::wstring ToWide(const std::string& s) {
     return out;
 }
 
+std::string WideToUtf8(const std::wstring& s) {
+    if (s.empty()) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, s.data(), (int)s.size(),
+                                  nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return {};
+    std::string out((size_t)len, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.data(), (int)s.size(),
+                        out.data(), len, nullptr, nullptr);
+    return out;
+}
+
+// API keys get pasted into the ini by hand, and a stray leading or
+// trailing space would otherwise be sent as part of the bearer token
+// and come back as an opaque 401.
+std::wstring TrimCopy(const std::wstring& s) {
+    const wchar_t* kSpace = L" \t\r\n";
+    const size_t first = s.find_first_not_of(kSpace);
+    if (first == std::wstring::npos) return {};
+    const size_t last = s.find_last_not_of(kSpace);
+    return s.substr(first, last - first + 1);
+}
+
 bool UnixToLocalSystemTime(long long unixSeconds, SYSTEMTIME* local) {
     if (unixSeconds < 0 || local == nullptr) return false;
     constexpr ULONGLONG kWindowsEpoch = 116444736000000000ULL;
@@ -384,6 +415,76 @@ std::wstring UnixToLocalDateTimeW(long long unixSec) {
     return buffer;
 }
 
+ClaudeUsageExportRecord MakeClaudeUsageExportRecord(
+    const ClaudeUsageData& data,
+    long long generatedAtUnix,
+    int refreshIntervalMinutes) {
+    ClaudeUsageExportRecord record;
+    record.status = ClassifyClaudeUsageExportStatus(data, generatedAtUnix);
+    record.generatedAtUnix = generatedAtUnix;
+    record.generatedAtLocal = WideToUtf8(
+        UnixToLocalDateTimeW(generatedAtUnix));
+    record.sourceFetchedAtUnix = data.lastSuccessTime > 0
+        ? static_cast<long long>(data.lastSuccessTime)
+        : 0;
+    record.sourceAgeSeconds = record.sourceFetchedAtUnix > 0
+        ? std::max(0LL, generatedAtUnix - record.sourceFetchedAtUnix)
+        : -1;
+    record.refreshIntervalMinutes = refreshIntervalMinutes;
+
+    record.fiveHourUsedPercent = data.fiveHourPercent;
+    record.fiveHourResetUtc = data.fiveHourResetAt;
+    if (!data.fiveHourResetAt.empty()) {
+        record.fiveHourResetLocal = WideToUtf8(
+            IsoToLocalDateTimeW(data.fiveHourResetAt));
+    }
+
+    record.sevenDayUsedPercent = data.sevenDayPercent;
+    record.sevenDayResetUtc = data.sevenDayResetAt;
+    if (!data.sevenDayResetAt.empty()) {
+        record.sevenDayResetLocal = WideToUtf8(
+            IsoToLocalDateTimeW(data.sevenDayResetAt));
+    }
+
+    record.fableWeeklyUsedPercent = data.fableWeeklyPercent;
+    record.fableWeeklyResetUtc = data.fableWeeklyResetAt;
+    if (!data.fableWeeklyResetAt.empty()) {
+        record.fableWeeklyResetLocal = WideToUtf8(
+            IsoToLocalDateTimeW(data.fableWeeklyResetAt));
+    }
+    return record;
+}
+
+bool WriteUtf8TextAtomically(
+    const std::wstring& targetPath,
+    const std::string& text) {
+    if (targetPath.empty() || text.size() > MAXDWORD) return false;
+
+    const std::wstring tempPath = targetPath + L".tmp";
+    HANDLE file = CreateFileW(
+        tempPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+
+    DWORD written = 0;
+    const BOOL writeOk = WriteFile(
+        file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
+    const BOOL flushOk = writeOk ? FlushFileBuffers(file) : FALSE;
+    CloseHandle(file);
+    if (!writeOk || !flushOk || written != text.size()) {
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+
+    if (!MoveFileExW(
+            tempPath.c_str(), targetPath.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tempPath.c_str());
+        return false;
+    }
+    return true;
+}
+
 // =====================================================================
 // GDI+ init
 // =====================================================================
@@ -398,12 +499,23 @@ void ShutdownGdiplus() {
 }
 
 // =====================================================================
+// Codex 5h ring visibility. OpenAI has both dropped and restored the 5h
+// window on some plans, so Auto follows whatever the usage payload last
+// reported instead of making the user flip a switch by hand.
+enum Codex5hMode { kCodex5hOff = 0, kCodex5hOn = 1, kCodex5hAuto = 2 };
+
+// OpenRouter balance block. Auto keeps it off the taskbar until the
+// balance actually needs attention, which is the only time it is news:
+// on free models the balance sits still for weeks.
+enum OrBalanceMode { kOrBalanceOff = 0, kOrBalanceOn = 1, kOrBalanceAuto = 2 };
+
 // Plugin options (persisted via registry/file)
 // =====================================================================
 struct PluginOptions {
     bool showPctSign = false;       // default: hide %
     bool showCredits = true;
     bool showReset = true;
+    int showCodex5hMode = kCodex5hAuto;  // Codex 5h ring + tooltip line
     bool showSubscription = false;
     bool showCustomExpiry = false;
     bool showStatus = true;
@@ -414,11 +526,24 @@ struct PluginOptions {
     bool showResetRadar = true;
     bool showAntigravity = true;    // show Antigravity ring + tier block
     bool showKiro = true;           // show Kiro ring + credits block
+    bool showOpenCodeGo = true;     // show OpenCode Go ring (5h $12 window)
+    // The taskbar item stops rendering above roughly 505px on a 96 DPI
+    // taskbar: at 533px the host pops "遇到不适当的参数" once per start.
+    // The ring costs ~34px, the today/limit block another ~58px, so the
+    // block is opt-in and the ring carries the signal by default.
+    bool showOpenRouter = false;    // show the OpenRouter ring
+    bool showOrToday = false;       // add the "OR今日 2/1000" block
+    int showOrBalanceMode = kOrBalanceAuto;  // balance block visibility
+    double orLowBalanceUsd = 2.0;   // below this the balance turns red
+    int tooltipMaxChars = 780;      // host limit is >809; keep margin
     int countdownShowBeforeHours = 24;
     int resetCreditWarningHours = 48;
     int resetRadarRefreshMinutes = 15;
-    int resetTodayRefreshMinutes = 60;
+    int resetTodayRefreshMinutes = 5;
+    std::wstring claudeUsageExportPath;
+    int claudeUsageExportMinutes = 10;
     std::string customSubExpiry;
+    std::string customSubExpiryCycle;  // "", "monthly", or "yearly"
     std::string antigravityPrimaryModel;  // featured model override
 };
 
@@ -427,8 +552,10 @@ struct PluginOptions {
 // =====================================================================
 struct DashData {
     int c5 = -1, c7 = -1, x5 = -1, x7 = -1;
+    int cFable = -1;
     std::string c5Reset;
     std::string c7Reset;
+    std::string cFableReset;
     long long x7ResetUnix = 0;   // Codex 7d reset unix timestamp
     long long usedCredits = 0;
     std::string currency;
@@ -457,7 +584,48 @@ struct DashData {
     long long kiroLimit = 0;
     bool kiroAvailable = false;
     double lastKiroOk = 0;
+    // OpenCode Go subscription: ring used %. The ring shows the higher of
+    // the weekly/monthly used % (the 5h window is too short to be
+    // informative); the 5h window only fills in as a fallback.
+    int go5Pct = -1;
+    int goWeekPct = -1;
+    int goMonthPct = -1;
+    long long goResetSec = -1;
+    std::string goSource;  // "server" (console-accurate) | "local" (db estimate)
+    double goCost5h = 0.0;
+    double goCostWeek = 0.0;
+    double goCostMonth = 0.0;
+    bool goAvailable = false;
+    double lastGoOk = 0;
+    // OpenRouter: today (UTC) free-model requests against the daily
+    // allowance, plus the credit balance that decides that allowance.
+    int orPct = -1;              // ring: requests today as % of the cap
+    long long orRequests = -1;   // -1 when no management key is set
+    int orDailyLimit = 0;        // 50 or 1000
+    double orBalance = 0.0;
+    bool orHasRequests = false;
+    bool orAvailable = false;
+    double lastOrOk = 0;
 };
+
+// Auto only drops the Codex 5h ring once a *successful* fetch comes back
+// without a 5h window. A failed fetch or a cold start keeps the ring, so the
+// taskbar item does not resize itself on every hiccup.
+bool ShouldShowCodex5h(const PluginOptions& opts, const DashData& data) {
+    if (opts.showCodex5hMode == kCodex5hOn) return true;
+    if (opts.showCodex5hMode == kCodex5hOff) return false;
+    return !(data.codexAvailable && data.x5 < 0);
+}
+
+bool OrBalanceIsLow(const PluginOptions& opts, const DashData& data) {
+    return data.orAvailable && data.orBalance < opts.orLowBalanceUsd;
+}
+
+bool ShouldShowOrBalance(const PluginOptions& opts, const DashData& data) {
+    if (opts.showOrBalanceMode == kOrBalanceOn) return true;
+    if (opts.showOrBalanceMode == kOrBalanceOff) return false;
+    return OrBalanceIsLow(opts, data);
+}
 
 std::wstring FormatCredits(const DashData& data) {
     if (!data.claudeAvailable) return L"--";
@@ -565,6 +733,35 @@ const AntigravityModelQuota* SelectFeaturedModel(
 std::wstring FormatKiroRemaining(const DashData& data) {
     if (!data.kiroAvailable || data.kiroRemaining < 0) return L"--";
     return std::to_wstring(data.kiroRemaining);
+}
+
+// "223/1000". Without a management key the count is unavailable but the
+// allowance is still known, so the numerator degrades to "?" rather
+// than hiding the block and moving everything sideways.
+std::wstring FormatOrRequests(const DashData& data) {
+    if (!data.orAvailable) return L"--";
+    const std::wstring cap = data.orDailyLimit > 0
+                                 ? std::to_wstring(data.orDailyLimit)
+                                 : L"?";
+    if (!data.orHasRequests) return L"?/" + cap;
+    return std::to_wstring(data.orRequests) + L"/" + cap;
+}
+
+std::wstring FormatOrBalance(const DashData& data) {
+    if (!data.orAvailable) return L"--";
+    wchar_t buf[32];
+    swprintf_s(buf, L"$%.2f", data.orBalance);
+    return buf;
+}
+
+// OpenCode Go spend on the 5h window as "$X.X/$12". (Diagnostics helper;
+// the ring itself now shows the higher of the weekly/monthly windows.)
+std::wstring FormatGoRemaining(const DashData& data) {
+    if (!data.goAvailable) return L"--";
+    wchar_t buffer[32];
+    swprintf_s(buffer, L"$%.1f/$%.0f",
+               data.goCost5h, OpenCodeGoUsageFetcher::kCap5h);
+    return buffer;
 }
 
 double SourceAge(bool available, double lastSuccess) {
@@ -678,10 +875,14 @@ public:
             snap = data_;
         }
         int width = 162;
-        if (opts.showResetRadar && snap.resetRadarWindowOpen) width += 16;
-        if (opts.showAntigravity || opts.showKiro) {
+        if (opts.showResetRadar && snap.resetRadarWindowOpen) width += 21;
+        if (snap.cFable >= 0) width += 34;
+        if (opts.showAntigravity || opts.showKiro || opts.showOpenCodeGo
+            || opts.showOpenRouter) {
             const int n = (opts.showAntigravity ? 1 : 0)
-                        + (opts.showKiro ? 1 : 0);
+                        + (opts.showKiro ? 1 : 0)
+                        + (opts.showOpenCodeGo ? 1 : 0)
+                        + (opts.showOpenRouter ? 1 : 0);
             width += 11 + n * 28 + (n > 1 ? 6 : 0);
         }
         bool hasInfoBlock = false;
@@ -695,6 +896,10 @@ public:
         if (opts.showCustomExpiry) addEstimatedBlock(45);
         if (opts.showAntigravity) addEstimatedBlock(38);
         if (opts.showKiro) addEstimatedBlock(45);
+        if (opts.showOpenRouter) {
+            if (opts.showOrToday) addEstimatedBlock(58);
+            if (ShouldShowOrBalance(opts, snap)) addEstimatedBlock(48);
+        }
         if (opts.showClaude7dReset) {
             addEstimatedBlock(opts.show7dCountdown ? 55 : 45);
         }
@@ -713,10 +918,16 @@ public:
         const LM m = GetMetrics(dpi);
         DashData snap;
         PluginOptions opts;
+        agentstatus::GroupStatus cowork;
+        agentstatus::GroupStatus code;
+        agentstatus::LightOptions lightOpts;
         {
             std::lock_guard<std::mutex> lk(mu_);
             snap = data_;
             opts = opts_;
+            cowork = cowork_;
+            code = code_;
+            lightOpts = lightOpts_;
         }
 
         const wchar_t* ff = L"Segoe UI";
@@ -735,23 +946,32 @@ public:
                 DashboardRenderer::MeasureTextWidth(
                     hdc, text, family, size, medium)));
         };
+        const bool showFable = snap.cFable >= 0;
+        const bool showCodex5h = ShouldShowCodex5h(opts, snap);
+        const int ringCount = (showCodex5h ? 4 : 3)
+                            + (showFable ? 1 : 0);
+        const int ringGapCount = (showCodex5h ? 2 : 1)
+                               + (showFable ? 1 : 0);
         int width = m.padX
-                  + 4 * ringCell
-                  + 2 * m.ringGap
+                  + ringCount * ringCell
+                  + ringGapCount * m.ringGap
                   + m.ringGroupGap
                   + 2 * m.sepMargin;
         const int extraRingCount = (opts.showAntigravity ? 1 : 0)
-                                 + (opts.showKiro ? 1 : 0);
+                                 + (opts.showKiro ? 1 : 0)
+                                 + (opts.showOpenCodeGo ? 1 : 0)
+                                 + (opts.showOpenRouter ? 1 : 0);
         if (extraRingCount > 0) {
             width += m.ringGroupGap
                    + extraRingCount * ringCell
                    + (extraRingCount > 1 ? m.ringGap : 0);
         }
         if (opts.showResetRadar && snap.resetRadarWindowOpen) {
-            width += textWidth(
-                L"\u26A1", L"Segoe UI Symbol",
-                layout.infoValueFont, true)
-                + std::max(3, m.ringGap / 2);
+            const float scale = dpi / 96.0f;
+            width += static_cast<int>(std::ceil(
+                (TaskbarVisualSpec::kResetRadarIndicatorOffsetX
+                 + TaskbarVisualSpec::kResetRadarIndicatorWidth
+                 + TaskbarVisualSpec::kResetRadarIndicatorGap) * scale));
         }
         bool hasInfoBlock = false;
         const auto addBlock = [&](const wchar_t* label, const std::wstring& value, int valueExtra = 0) {
@@ -771,6 +991,14 @@ public:
         }
         if (opts.showKiro) {
             addBlock(L"Kiro", FormatKiroRemaining(snap).c_str());
+        }
+        if (opts.showOpenRouter) {
+            if (opts.showOrToday) {
+                addBlock(L"OR\u4ECA\u65E5", FormatOrRequests(snap));
+            }
+            if (ShouldShowOrBalance(opts, snap)) {
+                addBlock(L"OR\u4F59\u989D", FormatOrBalance(snap));
+            }
         }
         if (opts.showSubscription) {
             const bool hasStatusDot = snap.subStatus == "active"
@@ -803,9 +1031,25 @@ public:
             addBlock(L"Codex", display.value);
         }
         if (hasInfoBlock) width -= m.infoGap;
+
+        // ── Cowork / Code lights ──
+        // Own group behind a divider, matching the ring groups, so the pair
+        // reads as its own module instead of hanging off the end of "Codex".
+        if (lightOpts.insideDashboard) {
+            const float slotH = SlotHeightHint(dpi);
+            const float scale = dpi / 96.0f;
+            const float lightsW = agentstatus::MeasureLightGroup(
+                hdc, scale, slotH, cowork, code, lightOpts);
+            if (lightsW > 0.0f) {
+                width += m.ringGroupGap
+                       + static_cast<int>(std::ceil(lightsW));
+            }
+        }
+
         width += m.padRight;
         {
             std::lock_guard<std::mutex> lk(mu_);
+            if (measuredW_ > width) width = measuredW_;
             cachedW_ = width;
         }
         return width;
@@ -840,17 +1084,24 @@ public:
 
         DashData snap;
         PluginOptions opts;
+        agentstatus::GroupStatus cowork;
+        agentstatus::GroupStatus code;
+        agentstatus::LightOptions lightOpts;
         std::optional<COLORREF> hostLabelColor;
         std::optional<COLORREF> hostValueColor;
         {
             std::lock_guard<std::mutex> lk(mu_);
             snap = data_;
             opts = opts_;
+            cowork = cowork_;
+            code = code_;
+            lightOpts = lightOpts_;
             hostLabelColor = hostLabelColor_;
             hostValueColor = hostValueColor_;
         }
         const DashboardPalette colors =
             ResolveDashboardPalette(dark, hostLabelColor, hostValueColor);
+        const bool showFable = snap.cFable >= 0;
 
         // Draw directly through Direct2D/DirectWrite at the final taskbar
         // scale. The renderer falls back to GDI/GDI+ when unavailable.
@@ -878,18 +1129,24 @@ public:
         const COLORREF cValue = colors.textValue;
 
         if (opts.showResetRadar && snap.resetRadarWindowOpen) {
-            const wchar_t* indicator = L"\u26A1";
-            const int indicatorWidth = static_cast<int>(std::ceil(
-                canvas.TextWidth(
-                    indicator, L"Segoe UI Symbol",
-                    layout.infoValueFont, true)));
-            canvas.DrawGradientTextAt(
-                indicator,
-                static_cast<float>(curX),
-                layout.infoValueCenterY - layout.infoValueFont * 0.7f,
-                L"Segoe UI Symbol", layout.infoValueFont,
-                true, dark);
-            curX += indicatorWidth + std::max(3, m.ringGap / 2);
+            const float indicatorOffsetX =
+                TaskbarVisualSpec::kResetRadarIndicatorOffsetX * visualScale;
+            const float indicatorGap =
+                TaskbarVisualSpec::kResetRadarIndicatorGap * visualScale;
+            const float indicatorWidth =
+                TaskbarVisualSpec::kResetRadarIndicatorWidth * visualScale;
+            const float indicatorHeight =
+                TaskbarVisualSpec::kResetRadarIndicatorHeight * visualScale;
+            canvas.DrawLightning(
+                static_cast<float>(curX) + indicatorOffsetX,
+                layout.ringCenterY - indicatorHeight * 0.5f
+                    - 1.0f * visualScale,
+                indicatorWidth,
+                indicatorHeight,
+                dark ? RGB(255, 241, 92) : RGB(255, 126, 32),
+                dark ? RGB(255, 72, 190) : RGB(255, 0, 150));
+            curX += static_cast<int>(std::ceil(
+                indicatorOffsetX + indicatorWidth + indicatorGap));
         }
 
         // ── Ring gauges ──
@@ -985,13 +1242,23 @@ public:
             snap.agAvailable, snap.lastAgOk, snap.refreshInProgress, colors);
         const COLORREF kiroFreshness = FreshnessMarkerColor(
             snap.kiroAvailable, snap.lastKiroOk, snap.refreshInProgress, colors);
+        const COLORREF orFreshness = FreshnessMarkerColor(
+            snap.orAvailable, snap.lastOrOk, snap.refreshInProgress, colors);
+        const COLORREF goFreshness = FreshnessMarkerColor(
+            snap.goAvailable, snap.lastGoOk, snap.refreshInProgress, colors);
         const int claude5Center = ring(
             snap.c5, GaugeColor(snap.c5, colors), L"5h",
             claudeFreshness, m.ringGap);
         const int claude7Center = ring(
             snap.c7, GaugeColor(snap.c7, colors), L"7d",
-            claudeFreshness, 0);
-        providerLabel(L"Claude", claude5Center, claude7Center);
+            claudeFreshness, showFable ? m.ringGap : 0);
+        int claudeLastCenter = claude7Center;
+        if (showFable) {
+            claudeLastCenter = ring(
+                snap.cFable, GaugeColor(snap.cFable, colors), L"Fable",
+                claudeFreshness, 0);
+        }
+        providerLabel(L"Claude", claude5Center, claudeLastCenter);
 
         const int groupSeparatorX = curX + m.ringGroupGap / 2;
         canvas.DrawLine(
@@ -1002,16 +1269,23 @@ public:
             colors.separator);
         curX += m.ringGroupGap;
 
-        const int codex5Center = ring(
-            snap.x5, GaugeColor(snap.x5, colors), L"5h",
-            codexFreshness, m.ringGap);
+        const bool showCodex5h = ShouldShowCodex5h(opts, snap);
+        int codex5Center = -1;
+        if (showCodex5h) {
+            codex5Center = ring(
+                snap.x5, GaugeColor(snap.x5, colors), L"5h",
+                codexFreshness, m.ringGap);
+        }
         const int codex7Center = ring(
             snap.x7, GaugeColor(snap.x7, colors), L"7d",
             codexFreshness, 0);
-        providerLabel(L"Codex", codex5Center, codex7Center);
+        providerLabel(L"Codex",
+                      showCodex5h ? codex5Center : codex7Center,
+                      codex7Center);
 
-        // ── Antigravity + Kiro group ──
-        if (opts.showAntigravity || opts.showKiro) {
+        // ── Antigravity + Kiro + OpenCode Go + OpenRouter group ──
+        if (opts.showAntigravity || opts.showKiro || opts.showOpenCodeGo
+            || opts.showOpenRouter) {
             const int group2SeparatorX = curX + m.ringGroupGap / 2;
             canvas.DrawLine(
                 static_cast<float>(group2SeparatorX),
@@ -1024,14 +1298,27 @@ public:
                 const int agCenter = ring(
                     snap.agPct, GaugeColor(snap.agPct, colors), L"AG",
                     agFreshness,
-                    opts.showKiro ? m.ringGap : 0);
+                    opts.showKiro || opts.showOpenCodeGo ? m.ringGap : 0);
                 (void)agCenter;
             }
             if (opts.showKiro) {
                 const int kiroCenter = ring(
                     snap.kiroPct, GaugeColor(snap.kiroPct, colors), L"Kiro",
-                    kiroFreshness, 0);
+                    kiroFreshness,
+                    opts.showOpenCodeGo || opts.showOpenRouter ? m.ringGap : 0);
                 (void)kiroCenter;
+            }
+            if (opts.showOpenCodeGo) {
+                const int goCenter = ring(
+                    snap.go5Pct, GaugeColor(snap.go5Pct, colors), L"Go",
+                    goFreshness, opts.showOpenRouter ? m.ringGap : 0);
+                (void)goCenter;
+            }
+            if (opts.showOpenRouter) {
+                const int orCenter = ring(
+                    snap.orPct, GaugeColor(snap.orPct, colors), L"OR",
+                    orFreshness, 0);
+                (void)orCenter;
             }
         }
 
@@ -1054,7 +1341,8 @@ public:
         };
         auto block = [&](const wchar_t* label, const wchar_t* value,
                          const wchar_t* sub = nullptr, COLORREF subClr = 0,
-                         bool gradientValue = false) {
+                         bool gradientValue = false,
+                         COLORREF valueClr = 0) {
             const float labelW =
                 canvas.TextWidth(label, ff, layout.infoLabelFont, false);
             const float valueW =
@@ -1088,7 +1376,7 @@ public:
                     layout.infoValueCenterY,
                     ff,
                     layout.infoValueFont,
-                    cValue,
+                    valueClr == 0 ? cValue : valueClr,
                     false);
             }
             if (sub) {
@@ -1125,6 +1413,23 @@ public:
 
         if (opts.showKiro) {
             block(L"Kiro", FormatKiroRemaining(snap).c_str());
+        }
+
+        if (opts.showOpenRouter) {
+            if (opts.showOrToday) {
+                block(L"OR\u4ECA\u65E5", FormatOrRequests(snap).c_str());
+            }
+            if (ShouldShowOrBalance(opts, snap)) {
+                // The whole point of the balance block is the warning,
+                // so a low balance turns the amount itself red. The
+                // block lambda also offers a third "sub" line, but it
+                // draws below the value row and outside what the host
+                // clips the item to -- no other caller uses it.
+                const bool low = OrBalanceIsLow(opts, snap);
+                block(L"OR\u4F59\u989D", FormatOrBalance(snap).c_str(),
+                      nullptr, 0, false,
+                      low ? colors.dotRed : 0);
+            }
         }
 
         if (opts.showSubscription) {
@@ -1200,6 +1505,43 @@ public:
                   display.gradient);
         }
 
+        // ── Cowork / Code lights ──
+        // A divider first, then the pair, on the same vertical centre as the
+        // two-line info blocks to its left. Without both, the lights read as
+        // punctuation trailing "Codex" and sit visibly below the other
+        // modules' baseline.
+        if (lightOpts.insideDashboard) {
+            const float scale = static_cast<float>(dpi) / 96.0f;
+            const float lightsW = agentstatus::MeasureLightGroup(
+                hdc, scale, layout.slotHeight, cowork, code, lightOpts);
+            if (lightsW > 0.0f) {
+                const int sepX = curX + m.ringGroupGap / 2;
+                canvas.DrawLine(
+                    static_cast<float>(sepX),
+                    layout.dividerTop,
+                    static_cast<float>(sepX),
+                    layout.dividerBottom,
+                    colors.separator);
+                curX += m.ringGroupGap;
+
+                // Midway between the info label and value lines: the optical
+                // centre of every other module on this row.
+                const float lightCenterY =
+                    (layout.infoLabelCenterY + layout.infoValueCenterY) / 2.0f;
+                const float used = agentstatus::DrawLightGroup(
+                    canvas, hdc, static_cast<float>(curX), lightCenterY, scale,
+                    layout.slotHeight, cowork, code, lightOpts, dark);
+                curX += static_cast<int>(std::ceil(used));
+            }
+        }
+
+        {
+            // Feed the real extent back so the reported width converges on
+            // what is actually painted (see measuredW_).
+            std::lock_guard<std::mutex> lk(mu_);
+            measuredW_ = curX - x + m.padRight;
+        }
+
         // ── Separator 2 + per-source freshness status ──
         if (savedDc != 0) RestoreDC(hdc, savedDc);
     }
@@ -1212,6 +1554,19 @@ public:
     void SetOptions(const PluginOptions& o) {
         std::lock_guard<std::mutex> lk(mu_);
         opts_ = o;
+        cachedW_ = 0;
+    }
+    // Cowork / Code state, so the two lights can be drawn as a trailing group
+    // inside this item rather than as separate taskbar items.
+    void SetAgentStatus(const agentstatus::GroupStatus& cowork,
+                        const agentstatus::GroupStatus& code,
+                        const agentstatus::LightOptions& lightOpts) {
+        std::lock_guard<std::mutex> lk(mu_);
+        cowork_ = cowork;
+        code_ = code;
+        lightOpts_ = lightOpts;
+        // The lights change this item's width (count digits, the Code light
+        // auto-hiding), so the cached width has to go with them.
         cachedW_ = 0;
     }
     void SetHostLabelColor(COLORREF color) {
@@ -1239,9 +1594,24 @@ private:
     mutable std::mutex mu_;
     DashData data_;
     PluginOptions opts_;
+    agentstatus::GroupStatus cowork_;
+    agentstatus::GroupStatus code_;
+    agentstatus::LightOptions lightOpts_;
     std::optional<COLORREF> hostLabelColor_;
     std::optional<COLORREF> hostValueColor_;
     mutable int cachedW_ = 0;
+    // Width the item ACTUALLY painted last time, padding included. The width
+    // estimate below has always run a little short of the real layout (the
+    // drift used to hide inside the right padding); with the lights riding at
+    // the far end it would clip them instead, so the item reports
+    // max(estimate, measured).
+    //
+    // This is deliberately NOT cleared by the setters. Data arrives every
+    // couple of seconds, and clearing it would drop the item back to the short
+    // estimate for the frame right after each update — the tail of the last
+    // element would visibly blink. Every paint rewrites it, so a layout that
+    // shrinks is back to the correct width one frame later.
+    mutable int measuredW_ = 0;
     mutable float slotHeight_ = 0.0f;
 };
 
@@ -1252,7 +1622,36 @@ class AIUsagePlugin final : public ITMPlugin {
 public:
     static AIUsagePlugin& Instance() { static AIUsagePlugin p; return p; }
 
-    IPluginItem* GetItem(int i) override { return i == 0 ? &dash_ : nullptr; }
+    // 0 = usage dashboard, and — only when the lights are NOT drawn inside it —
+    // 1 = Cowork light, 2 = Code light.
+    //
+    // Hiding the two light items in the default placement is not cosmetic, it
+    // is what keeps the dashboard readable. TrafficMonitor's taskbar window is
+    // TASKBAR_WND_HEIGHT tall and, in its default two-row layout, hands each
+    // display item half of that (~16 px) unless the item gets the row pair to
+    // itself. Plugin API 7 has no way to ask for the full height, so the only
+    // lever is the item COUNT: with the dashboard as the plugin's sole item it
+    // keeps the whole ~32 px and draws its rings at full size; add two more
+    // items and all three drop to one row each, which squeezes the rings to
+    // half size and collapses the label and value lines onto each other.
+    //
+    // Returning nullptr here stops the host's enumeration, so the lights are
+    // never registered at all. Switching LightsInsideDashboard to 0 therefore
+    // needs a TrafficMonitor restart before the separate items appear.
+    IPluginItem* GetItem(int i) override {
+        bool inside = true;
+        {
+            std::lock_guard<std::mutex> lk(statusMu_);
+            inside = lightOpts_.insideDashboard;
+        }
+        if (i == 0) return &dash_;
+        if (inside) return nullptr;
+        switch (i) {
+            case 1: return &coworkLight_;
+            case 2: return &codeLight_;
+            default: return nullptr;
+        }
+    }
 
     // Releases the fetch-cycle lock. Called at the end of every worker path
     // (normal completion and early-stop), so busy_ is always cleared.
@@ -1285,9 +1684,69 @@ public:
             worker_.join(); // thread already finished; instant
         }
         // In-flight case: return without joining; process exit reclaims it.
+        StopStatusWorker();
+    }
+
+    // Starts the indicator-light scanner. Idempotent, so DataRequired() can
+    // call it on every tick; the first call after the host supplies the config
+    // directory is the one that takes effect.
+    void EnsureStatusWorker() {
+        if (statusStarted_.exchange(true)) return;
+        statusWorker_ = std::thread([this] {
+            while (!stop_.load()) {
+                agentstatus::WatcherConfig cfg;
+                agentstatus::LightOptions opts;
+                {
+                    std::lock_guard<std::mutex> lk(statusMu_);
+                    cfg = watcherCfg_;
+                    opts = lightOpts_;
+                }
+                const auto snap = agentstatus::AgentStatusWatcher::Scan(cfg);
+                coworkLight_.Update(snap.cowork, opts);
+                codeLight_.Update(snap.code, opts);
+                // The dashboard draws the pair itself in the default
+                // inside-dashboard placement; the standalone items collapse to
+                // zero width in that mode, so only one of the two ever paints.
+                dash_.SetAgentStatus(snap.cowork, snap.code, opts);
+                {
+                    std::lock_guard<std::mutex> lk(statusMu_);
+                    statusTip_ = coworkLight_.TooltipLines();
+                    const std::wstring codeTip = codeLight_.TooltipLines();
+                    if (!codeTip.empty()) {
+                        if (!statusTip_.empty()) statusTip_ += L"\n";
+                        statusTip_ += codeTip;
+                    }
+                }
+                // ~1.5 s cadence, checked in short slices so shutdown is
+                // responsive. A scan touches only directory metadata plus a
+                // few small reads, so this stays far below one CPU percent.
+                for (int i = 0; i < 15 && !stop_.load(); ++i) ::Sleep(100);
+            }
+            statusExited_.store(true);
+        });
+    }
+
+    // Bounded, lock-free wait mirroring the fetch worker's shutdown path. The
+    // scanner only ever blocks on short filesystem reads, so it observes stop_
+    // within one slice.
+    void StopStatusWorker() {
+        if (!statusWorker_.joinable()) return;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!statusExited_.load()
+               && std::chrono::steady_clock::now() < deadline) {
+            ::Sleep(20);
+        }
+        if (statusExited_.load() && statusWorker_.joinable()) {
+            statusWorker_.join();
+        }
     }
 
     void DataRequired() override {
+        // The lights refresh on their own thread and are independent of the
+        // quota fetch cycle, so they keep updating even while a network fetch
+        // is in flight or has failed.
+        EnsureStatusWorker();
         auto now = std::chrono::steady_clock::now();
         bool applyPendingConfig = false;
         {
@@ -1327,19 +1786,27 @@ public:
             };
             auto claude = claude_.Fetch();
             if (stop_.load()) { FinishFetch(); markDone(); return; }
+            MaybeExportClaudeUsage(claude);
             auto codex = codex_.Fetch();
             if (stop_.load()) { FinishFetch(); markDone(); return; }
             auto ag = ag_.Fetch();
             if (stop_.load()) { FinishFetch(); markDone(); return; }
             auto kiro = kiro_.Fetch();
             if (stop_.load()) { FinishFetch(); markDone(); return; }
+            auto go = go_.Fetch();
+            if (stop_.load()) { FinishFetch(); markDone(); return; }
+            auto router = router_.Fetch();
+            if (stop_.load()) { FinishFetch(); markDone(); return; }
             DashData d = dash_.GetSnapshot();
             const double t = static_cast<double>(time(nullptr));
             if (claude.success) {
                 d.c5 = std::clamp(claude.fiveHourPercent, -1, 100);
                 d.c7 = std::clamp(claude.sevenDayPercent, -1, 100);
+                d.cFable = std::clamp(
+                    claude.fableWeeklyPercent, -1, 100);
                 d.c5Reset = claude.fiveHourResetAt;
                 d.c7Reset = claude.sevenDayResetAt;
+                d.cFableReset = claude.fableWeeklyResetAt;
                 d.usedCredits = claude.usedCredits;
                 d.currency = claude.currency;
                 d.decPlaces = claude.decimalPlaces;
@@ -1397,11 +1864,82 @@ public:
                 d.kiroAvailable = true;
                 d.lastKiroOk = kiro.lastSuccessTime > 0 ? kiro.lastSuccessTime : t;
             }
+            if (router.success) {
+                d.orBalance = router.balance;
+                d.orDailyLimit = router.freeDailyLimit;
+                d.orHasRequests = router.hasRequestCount;
+                d.orRequests = router.requestsToday;
+                // Without a management key there is no count, so the
+                // ring falls back to how much of the purchased credit
+                // has been spent -- the only other number available.
+                if (router.hasRequestCount) {
+                    d.orPct = std::clamp(router.requestUsedPercent, 0, 100);
+                } else if (router.totalCredits > 0) {
+                    d.orPct = std::clamp(static_cast<int>(std::lround(
+                        router.totalUsage / router.totalCredits * 100.0)), 0, 100);
+                }
+                d.orAvailable = true;
+                d.lastOrOk = router.lastSuccessTime > 0 ? router.lastSuccessTime : t;
+            }
+            if (go.success) {
+                if (go.source == "server") {
+                    // Console-accurate percentages (used %), identical to the
+                    // opencode.ai dashboard. The ring shows the higher of the
+                    // weekly/monthly used % (the rolling-5h window is too
+                    // short to be informative); 5h only fills in when both
+                    // week and month are unavailable.
+                    d.goSource = "server";
+                    int goRingPct = -1;
+                    if (go.weekly.usedPercent >= 0) {
+                        d.goWeekPct = std::clamp(go.weekly.usedPercent, 0, 100);
+                        goRingPct = d.goWeekPct;
+                    }
+                    if (go.monthly.usedPercent >= 0
+                        && go.monthly.status != "unlimited") {
+                        d.goMonthPct = std::clamp(go.monthly.usedPercent, 0, 100);
+                        goRingPct = std::max(goRingPct, d.goMonthPct);
+                    }
+                    if (goRingPct < 0 && go.rolling.usedPercent >= 0) {
+                        goRingPct = std::clamp(go.rolling.usedPercent, 0, 100);
+                    }
+                    d.go5Pct = goRingPct;
+                    d.goResetSec = go.rolling.resetInSec;
+                    d.goAvailable = true;
+                } else if (go.hasGoUsage && go.localPct5h >= 0) {
+                    // Local-DB estimate: same ring rule — the higher of the
+                    // weekly/monthly used % (dollars spent vs. cap), with the
+                    // 5h window as a fallback.
+                    d.goSource = "local";
+                    d.goCost5h = go.cost5h;
+                    d.goCostWeek = go.costWeek;
+                    d.goCostMonth = go.costMonth;
+                    int goRingPct = -1;
+                    if (go.costWeek > 0) {
+                        goRingPct = std::clamp(static_cast<int>(std::lround(
+                            go.costWeek / OpenCodeGoUsageFetcher::kCapWeek
+                                * 100.0)), 0, 100);
+                    }
+                    if (go.costMonth > 0) {
+                        goRingPct = std::max(goRingPct, std::clamp(
+                            static_cast<int>(std::lround(
+                                go.costMonth / OpenCodeGoUsageFetcher::kCapMonth
+                                    * 100.0)), 0, 100));
+                    }
+                    if (goRingPct < 0) {
+                        goRingPct = std::clamp(100 - go.localPct5h, 0, 100);
+                    }
+                    d.go5Pct = goRingPct;
+                    d.goAvailable = true;
+                }
+                if (d.goAvailable) {
+                    d.lastGoOk = go.lastSuccessTime > 0 ? go.lastSuccessTime : t;
+                }
+            }
             d.refreshInProgress = false;
             dash_.SetSnapshot(d);
             {
                 std::lock_guard<std::mutex> lk(mu_);
-                tip_ = BuildTip(claude, codex, ag, kiro);
+                tip_ = BuildTip(claude, codex, ag, kiro, go, router);
             }
             FinishFetch();
             markDone();
@@ -1411,7 +1949,7 @@ public:
     const wchar_t* GetInfo(PluginInfoIndex i) override {
         switch (i) {
             case TMI_NAME:        return L"AI Usage";
-            case TMI_DESCRIPTION: return L"Claude, Codex, Antigravity & Kiro usage dashboard.";
+            case TMI_DESCRIPTION: return L"Claude, Codex, Antigravity, Kiro, OpenCode Go & OpenRouter usage dashboard.";
             case TMI_AUTHOR:      return L"B-22";
             case TMI_COPYRIGHT:   return L"MIT";
             case TMI_VERSION:     return CODEX_USAGE_VERSION_WIDE;
@@ -1428,8 +1966,32 @@ public:
         // update refreshes the tip — reading freed memory surfaces as random
         // Win32 failures (e.g. ERROR_INVALID_PARAMETER once data arrives).
         // The fixed array never moves and bounds the length at the same time.
+        //
+        // The light detail is appended after the quota rows. It is copied out
+        // from under statusMu_ BEFORE mu_ is taken: the scanner thread only
+        // ever holds statusMu_, so acquiring the two in this fixed order can
+        // never deadlock against it.
+        std::wstring lights;
+        {
+            std::lock_guard<std::mutex> lk(statusMu_);
+            lights = statusTip_;
+        }
         std::lock_guard<std::mutex> lk(mu_);
-        wcsncpy_s(tooltipBuf_, tip_.c_str(), _TRUNCATE);
+        std::wstring full = tip_;
+        if (!lights.empty()) {
+            if (!full.empty()) full += L"\n";
+            full += lights;
+        }
+        // The host refuses a tooltip past roughly 810 characters: it pops
+        // a "遇到不适当的参数" message box once, right after the first
+        // refresh that pushes the text over. Measured by ramping the cap
+        // upward on a live taskbar -- 736 and 809 are fine, 855 is not.
+        // The length drifts with error lines and reset-radar state, so
+        // this has to be enforced rather than left to luck.
+        const size_t cap = static_cast<size_t>(
+            std::clamp(dash_.GetOptions().tooltipMaxChars, 200, 800));
+        const std::wstring capped = TruncateTooltip(full, cap);
+        wcsncpy_s(tooltipBuf_, capped.c_str(), _TRUNCATE);
         return tooltipBuf_;
     }
 
@@ -1519,7 +2081,11 @@ public:
             L" 16. Custom Sub Expiry:     %s\n"
             L" 17. Show Antigravity:      %s\n"
             L" 18. Show Kiro Credits:     %s\n"
-            L" 19. AG Primary Model:      %s\n\n"
+            L" 19. AG Primary Model:      %s\n"
+            L" 20. Show Codex 5h Ring:    %s   (Auto = follow API)\n"
+            L" 21. Show OpenCode Go Ring: %s\n"
+            L" 22. Show OpenRouter:      %s\n"
+            L" 23. OR Balance Block:     %s   (Auto = only when low)\n\n"
             L"Proxy Settings:\n"
             L"  Proxy Server:   %s\n"
             L"  Require Proxy:  %s\n"
@@ -1541,6 +2107,13 @@ public:
             L"  AG Tier:         %s\n"
             L"  Kiro Ring (used%%): %d\n"
             L"  Kiro Remaining:  %lld\n"
+            L"  Go Ring (used%%):  %d\n"
+            L"  Go Week/Month:     %d%% / %d%%\n"
+            L"  Go Source:         %s\n"
+            L"  Go 5h/Week/Month: $%.1f / $%.1f / $%.1f\n"
+            L"  OR Ring (used%%):  %d\n"
+            L"  OR Today:        %s\n"
+            L"  OR Balance:      $%.4f\n"
             L"  Reset Cards:     %d\n"
             L"  Card Expiry:     %s\n"
             L"  Radar Window:    %s\n"
@@ -1551,6 +2124,7 @@ public:
             L"  ShowPctSign=0\n"
             L"  ShowCredits=1\n"
             L"  ShowReset=1\n"
+            L"  ShowCodex5h=auto\n"
             L"  ShowSubscription=0\n"
             L"  ShowCustomExpiry=1\n"
             L"  ShowStatus=1\n"
@@ -1562,10 +2136,12 @@ public:
             L"  ResetCreditWarningHours=48\n"
             L"  ShowResetRadar=1\n"
             L"  ResetRadarRefreshMinutes=15\n"
-            L"  RunwayResetRefreshMinutes=60\n"
+            L"  RunwayResetRefreshMinutes=5\n"
             L"  ShowAntigravity=1\n"
             L"  ShowKiro=0\n"
+            L"  ShowOpenCodeGo=1\n"
             L"  CustomSubExpiry=\n"
+            L"  CustomSubExpiryCycle=\n"
             L"  ProxyServer=\n"
             L"  RequireProxy=1\n"
             L"  AllowedExitIPs=203.0.113.10\n"
@@ -1576,7 +2152,15 @@ public:
             L"  RefreshToken=\n"
             L"  PrimaryModel=\n"
             L"  [Kiro]\n"
-            L"  TokenPath=",
+            L"  TokenPath=\n"
+            L"  [OpenCodeGo]\n"
+            L"  AuthCookie=\n"
+            L"  WorkspaceId=\n"
+            L"  [OpenRouter]\n"
+            L"  ApiKey=\n"
+            L"  ManagementKey=\n"
+            L"  FreeDailyLimit=0\n"
+            L"  LowBalanceUsd=2.0\n",
             o.showPctSign ? L"Yes" : L"No",
             o.showCredits ? L"Yes" : L"No",
             o.showReset ? L"Yes" : L"No",
@@ -1596,6 +2180,14 @@ public:
             o.showAntigravity ? L"Yes" : L"No",
             o.showKiro ? L"Yes" : L"No",
             o.antigravityPrimaryModel.empty() ? L"(auto)" : std::wstring(o.antigravityPrimaryModel.begin(), o.antigravityPrimaryModel.end()).c_str(),
+            o.showCodex5hMode == kCodex5hOn    ? L"Yes"
+            : o.showCodex5hMode == kCodex5hOff ? L"No"
+                                               : L"Auto",
+            o.showOpenCodeGo ? L"Yes" : L"No",
+            o.showOpenRouter ? L"Yes" : L"No",
+            o.showOrBalanceMode == kOrBalanceOn    ? L"Yes"
+            : o.showOrBalanceMode == kOrBalanceOff ? L"No"
+                                                   : L"Auto",
             proxyServer.empty() ? L"(system)" : proxyServer.c_str(),
             requireProxy ? L"Yes" : L"No",
             allowedExitIps.empty() ? L"(disabled)" : allowedExitIps.c_str(),
@@ -1611,6 +2203,12 @@ public:
             snap.agPct,
             FormatAgTier(snap.agTier).empty() ? L"--" : FormatAgTier(snap.agTier).c_str(),
             snap.kiroPct, snap.kiroRemaining,
+            snap.go5Pct, snap.goWeekPct, snap.goMonthPct,
+            snap.goSource.empty() ? L"none" : ToWide(snap.goSource).c_str(),
+            snap.goCost5h, snap.goCostWeek, snap.goCostMonth,
+            snap.orPct,
+            FormatOrRequests(snap).c_str(),
+            snap.orBalance,
             snap.resetCreditCount,
             resetCreditExpiry.c_str(),
             snap.resetRadarWindowOpen ? L"Open" : L"Closed",
@@ -1642,6 +2240,46 @@ public:
     }
 
 private:
+    void MaybeExportClaudeUsage(const ClaudeUsageData& data) {
+        const PluginOptions options = dash_.GetOptions();
+        if (options.claudeUsageExportPath.empty()) return;
+
+        const auto nowSteady = std::chrono::steady_clock::now();
+        const long long nowUnix = static_cast<long long>(time(nullptr));
+        const std::string status =
+            ClassifyClaudeUsageExportStatus(data, nowUnix);
+
+        if (lastClaudeExportPath_ != options.claudeUsageExportPath
+            || lastClaudeExportMinutes_ != options.claudeUsageExportMinutes) {
+            lastClaudeExportPath_ = options.claudeUsageExportPath;
+            lastClaudeExportMinutes_ = options.claudeUsageExportMinutes;
+            lastClaudeExport_ = {};
+            lastClaudeExportStatus_.clear();
+        }
+
+        const long long secondsSinceLastWrite =
+            lastClaudeExport_.time_since_epoch().count() == 0
+            ? -1
+            : std::chrono::duration_cast<std::chrono::seconds>(
+                nowSteady - lastClaudeExport_).count();
+        if (!ShouldWriteClaudeUsageExport(
+                secondsSinceLastWrite,
+                options.claudeUsageExportMinutes,
+                status,
+                lastClaudeExportStatus_)) {
+            return;
+        }
+
+        const ClaudeUsageExportRecord record = MakeClaudeUsageExportRecord(
+            data, nowUnix, options.claudeUsageExportMinutes);
+        if (WriteUtf8TextAtomically(
+                options.claudeUsageExportPath,
+                BuildClaudeUsageExportText(record))) {
+            lastClaudeExport_ = nowSteady;
+            lastClaudeExportStatus_ = status;
+        }
+    }
+
     AIUsagePlugin() {
         // Some TrafficMonitor builds do not send EI_CONFIG_DIR to plugins.
         // Fall back to the directory of the running host executable so local
@@ -1695,6 +2333,11 @@ private:
         GetPrivateProfileStringW(L"AIUsage", L"ShowReset", L"1", buf, 256, iniPath.c_str());
         o.showReset = (buf[0] == L'1');
 
+        GetPrivateProfileStringW(L"AIUsage", L"ShowCodex5h", L"auto", buf, 256, iniPath.c_str());
+        o.showCodex5hMode = (buf[0] == L'0') ? kCodex5hOff
+                          : (buf[0] == L'1') ? kCodex5hOn
+                                                     : kCodex5hAuto;
+
         GetPrivateProfileStringW(L"AIUsage", L"ShowSubscription", L"0", buf, 256, iniPath.c_str());
         o.showSubscription = (buf[0] == L'1');
 
@@ -1733,6 +2376,31 @@ private:
             buf, 256, iniPath.c_str());
         o.showKiro = (buf[0] == L'1');
 
+        GetPrivateProfileStringW(
+            L"AIUsage", L"ShowOpenRouter", L"0",
+            buf, 256, iniPath.c_str());
+        o.showOpenRouter = (buf[0] == L'1');
+
+        o.tooltipMaxChars = GetPrivateProfileIntW(
+            L"AIUsage", L"TooltipMaxChars", 780, iniPath.c_str());
+
+        GetPrivateProfileStringW(
+            L"AIUsage", L"ShowOpenRouterToday", L"0",
+            buf, 256, iniPath.c_str());
+        o.showOrToday = (buf[0] == L'1');
+
+        GetPrivateProfileStringW(
+            L"AIUsage", L"ShowOpenRouterBalance", L"auto",
+            buf, 256, iniPath.c_str());
+        o.showOrBalanceMode = (buf[0] == L'0') ? kOrBalanceOff
+                            : (buf[0] == L'1') ? kOrBalanceOn
+                                                       : kOrBalanceAuto;
+
+        GetPrivateProfileStringW(
+            L"AIUsage", L"ShowOpenCodeGo", L"1",
+            buf, 256, iniPath.c_str());
+        o.showOpenCodeGo = (buf[0] == L'1');
+
         o.countdownShowBeforeHours = std::clamp(
             static_cast<int>(GetPrivateProfileIntW(
                 L"AIUsage", L"CountdownShowBeforeHours", 24, iniPath.c_str())),
@@ -1750,9 +2418,20 @@ private:
 
         o.resetTodayRefreshMinutes = std::clamp(
             static_cast<int>(GetPrivateProfileIntW(
-                L"AIUsage", L"RunwayResetRefreshMinutes", 60,
+                L"AIUsage", L"RunwayResetRefreshMinutes", 5,
                 iniPath.c_str())),
-            15, 240);
+            5, 240);
+
+        GetPrivateProfileStringW(
+            L"AIUsage", L"ClaudeUsageExportPath", L"",
+            buf, 1024, iniPath.c_str());
+        o.claudeUsageExportPath = buf;
+
+        o.claudeUsageExportMinutes = std::clamp(
+            static_cast<int>(GetPrivateProfileIntW(
+                L"AIUsage", L"ClaudeUsageExportMinutes", 10,
+                iniPath.c_str())),
+            1, 1440);
 
         GetPrivateProfileStringW(
             L"AIUsage", L"CustomSubExpiry", L"", buf, 256, iniPath.c_str());
@@ -1768,7 +2447,72 @@ private:
             }
         }
 
+        GetPrivateProfileStringW(
+            L"AIUsage", L"CustomSubExpiryCycle", L"", buf, 32, iniPath.c_str());
+        o.customSubExpiryCycle = WideToUtf8(TrimCopy(buf));
+        for (char& c : o.customSubExpiryCycle) c = static_cast<char>(tolower(c));
+
+        if (!o.customSubExpiry.empty() && !o.customSubExpiryCycle.empty()) {
+            SYSTEMTIME today{};
+            GetLocalTime(&today);
+            o.customSubExpiry = AdvanceExpiryToFuture(
+                o.customSubExpiry, o.customSubExpiryCycle,
+                today.wYear, today.wMonth, today.wDay);
+        }
+
         dash_.SetOptions(o);
+
+        // ---- Cowork / Code indicator lights ----
+        {
+            agentstatus::WatcherConfig wc;
+            agentstatus::LightOptions lo;
+
+            wc.idleTimeoutMinutes = std::clamp(
+                static_cast<int>(GetPrivateProfileIntW(
+                    L"AgentStatus", L"AgentIdleTimeoutMinutes", 30,
+                    iniPath.c_str())),
+                1, 1440);
+            // How long a Cowork turn that has stopped writing to audit.jsonl
+            // still counts as working. Covers a slow tool call without leaving
+            // a killed session yellow until the idle timeout.
+            wc.busyGraceMinutes = std::clamp(
+                static_cast<int>(GetPrivateProfileIntW(
+                    L"AgentStatus", L"CoworkBusyGraceMinutes", 10,
+                    iniPath.c_str())),
+                1, 120);
+            // Marker files written by the PermissionRequest hook. Without them
+            // the Code light still distinguishes working from idle, it just
+            // cannot turn red.
+            wc.markerDir = configDir_ + L"\\agent-status\\code";
+            wc.hideCodeWhenIdle =
+                GetPrivateProfileIntW(
+                    L"AgentStatus", L"HideCodeLightWhenIdle", 1, iniPath.c_str()) != 0;
+
+            lo.showCowork =
+                GetPrivateProfileIntW(
+                    L"AgentStatus", L"ShowCoworkLight", 1, iniPath.c_str()) != 0;
+            lo.showCode =
+                GetPrivateProfileIntW(
+                    L"AgentStatus", L"ShowCodeLight", 1, iniPath.c_str()) != 0;
+            lo.hideCodeWhenIdle = wc.hideCodeWhenIdle;
+            lo.showLabel =
+                GetPrivateProfileIntW(
+                    L"AgentStatus", L"ShowAgentLightLabel", 1, iniPath.c_str()) != 0;
+            lo.showCount =
+                GetPrivateProfileIntW(
+                    L"AgentStatus", L"ShowAgentLightCount", 1, iniPath.c_str()) != 0;
+            lo.insideDashboard =
+                GetPrivateProfileIntW(
+                    L"AgentStatus", L"LightsInsideDashboard", 1,
+                    iniPath.c_str()) != 0;
+            lo.chip =
+                GetPrivateProfileIntW(
+                    L"AgentStatus", L"LightChip", 1, iniPath.c_str()) != 0;
+
+            std::lock_guard<std::mutex> lk(statusMu_);
+            watcherCfg_ = std::move(wc);
+            lightOpts_ = lo;
+        }
 
         // Read proxy settings
         GetPrivateProfileStringW(L"AIUsage", L"ProxyServer", L"", buf, 1024, iniPath.c_str());
@@ -1833,6 +2577,29 @@ private:
             agAccessToken, agRefreshToken, agClientId, agClientSecret);
         ag_.SetPrimaryModel(o.antigravityPrimaryModel);
 
+        // OpenRouter credentials ([OpenRouter] section). Two separate
+        // keys by necessity: the normal key reads the balance, and only
+        // a management key may call the analytics endpoint that carries
+        // the request count.
+        router_.SetEnabled(o.showOpenRouter);
+        router_.SetProxyConfig(proxyConfig_);
+        {
+            wchar_t keyBuf[512];
+            GetPrivateProfileStringW(L"OpenRouter", L"ApiKey", L"",
+                                     keyBuf, 512, iniPath.c_str());
+            router_.SetApiKey(WideToUtf8(TrimCopy(keyBuf)));
+            GetPrivateProfileStringW(L"OpenRouter", L"ManagementKey", L"",
+                                     keyBuf, 512, iniPath.c_str());
+            router_.SetManagementKey(WideToUtf8(TrimCopy(keyBuf)));
+            router_.SetFreeDailyLimitOverride(GetPrivateProfileIntW(
+                L"OpenRouter", L"FreeDailyLimit", 0, iniPath.c_str()));
+            wchar_t lowBuf[64];
+            GetPrivateProfileStringW(L"OpenRouter", L"LowBalanceUsd", L"2.0",
+                                     lowBuf, 64, iniPath.c_str());
+            const double low = _wtof(lowBuf);
+            o.orLowBalanceUsd = low > 0.0 ? low : 2.0;
+        }
+
         // Kiro token cache path override ([Kiro] section).
         kiro_.SetEnabled(o.showKiro);
         kiro_.SetProxyConfig(proxyConfig_);
@@ -1842,13 +2609,47 @@ private:
         if (kiroPath[0] != L'\0') {
             kiro_.SetTokenFilePath(kiroPath);
         }
+
+        // OpenCode Go: server-side console data via the browser session
+        // cookie ([OpenCodeGo] AuthCookie=). Falls back to the local
+        // opencode.db estimate when no cookie is configured.
+        go_.SetEnabled(o.showOpenCodeGo);
+        go_.SetProxyConfig(proxyConfig_);
+        wchar_t goAuth[4096];
+        GetPrivateProfileStringW(
+            L"OpenCodeGo", L"AuthCookie", L"", goAuth, 4096, iniPath.c_str());
+        if (goAuth[0] != L'\0') {
+            std::string cookie = WideToUtf8(goAuth);
+            // Strip a leading "auth=" / "Cookie:" prefix if pasted verbatim.
+            const std::string lower = [&]() {
+                std::string l = cookie;
+                std::transform(l.begin(), l.end(), l.begin(), ::tolower);
+                return l;
+            }();
+            if (lower.rfind("auth=", 0) == 0) cookie = cookie.substr(5);
+            if (lower.rfind("cookie:", 0) == 0) cookie = cookie.substr(7);
+            go_.SetAuthCookie(cookie);
+        } else {
+            go_.SetAuthCookie("");
+        }
+        wchar_t goWs[256];
+        GetPrivateProfileStringW(
+            L"OpenCodeGo", L"WorkspaceId", L"", goWs, 256, iniPath.c_str());
+        if (goWs[0] != L'\0') {
+            go_.SetWorkspaceId(WideToUtf8(goWs));
+        } else {
+            go_.SetWorkspaceId("");
+        }
         dash_.SetOptions(o);
     }
 
     std::wstring BuildTip(const ClaudeUsageData& c, const UsageSnapshot& x,
                           const AntigravityUsageData& ag,
-                          const KiroCreditsData& kiro) const {
+                          const KiroCreditsData& kiro,
+                          const OpenCodeGoUsageData& go,
+                          const OpenRouterUsageData& router) const {
         // 10-cell ASCII progress bar: [##########] (any font, no width math)
+        const PluginOptions opts = dash_.GetOptions();
         auto bar = [](int remaining) -> std::wstring {
             int filled = std::clamp((remaining + 5) / 10, 0, 10); // round 0..10
             std::wstring b = L"[";
@@ -1917,16 +2718,26 @@ private:
                 c.sevenDayPercent >= 0
                     ? 100 - c.sevenDayPercent : -1,
                 addReset(c.sevenDayResetAt));
+            if (c.fableWeeklyPercent >= 0) {
+                addQuotaLine(
+                    L"Claude", L"Fable",
+                    100 - c.fableWeeklyPercent,
+                    addReset(c.fableWeeklyResetAt));
+            }
         } else {
             t += L" Claude [!] \u672A\u83B7\u53D6\n"; // 未获取
         }
         if (x.success) {
-            addQuotaLine(
-                L"Codex", L"5h", x.fiveHour.remainingPercent,
-                x.fiveHour.resetAtUnixSeconds > 0
-                    ? UnixToLocalDateTimeW(
-                        x.fiveHour.resetAtUnixSeconds)
-                    : L"");
+            if (opts.showCodex5hMode != kCodex5hOff
+                && (opts.showCodex5hMode == kCodex5hOn
+                    || x.fiveHour.remainingPercent >= 0)) {
+                addQuotaLine(
+                    L"Codex", L"5h", x.fiveHour.remainingPercent,
+                    x.fiveHour.resetAtUnixSeconds > 0
+                        ? UnixToLocalDateTimeW(
+                            x.fiveHour.resetAtUnixSeconds)
+                        : L"");
+            }
             addQuotaLine(
                 L"Codex", L"7d", x.weekly.remainingPercent,
                 x.weekly.resetAtUnixSeconds > 0
@@ -1937,7 +2748,8 @@ private:
             t += L" Codex [!] \u672A\u83B7\u53D6\n"; // 未获取
         }
 
-        if (ag.success && !ag.models.empty()) {
+        if (opts.showAntigravity) {
+            if (ag.success && !ag.models.empty()) {
             // Dedup rule (user preference): keep every non-Gemini model
             // (Claude/GPT/others), and for Gemini keep only the LATEST
             // version of each variant ("Gemini 3.6 Flash High" wins over
@@ -1982,9 +2794,10 @@ private:
             if (!agTierLabel.empty()) {
                 t += L"  \u5957\u9910  " + agTierLabel + L"\n"; // 套餐
             }
-        } else {
-            // 未授权 → 双击 ag-login.exe
-            t += L" \u53CD\u91CD\u529B [!] \u672A\u6388\u6743 \u2192 \u53CC\u51FB ag-login.exe\n";
+            } else {
+                // 未授权 → 双击 ag-login.exe
+                t += L" \u53CD\u91CD\u529B [!] \u672A\u6388\u6743 \u2192 \u53CC\u51FB ag-login.exe\n";
+            }
         }
 
         if (kiro.success) {
@@ -2001,6 +2814,145 @@ private:
             t += L"\n";
         } else {
             t += L" Kiro Credits [!] \u672A\u767B\u5F55\n"; // 未登录
+        }
+
+        if (opts.showOpenRouter) {
+            if (router.success) {
+                // One line, not two: the tooltip budget below is tight
+                // and every provider has to fit inside it.
+                t += L" OpenRouter    ";
+                if (router.hasRequestCount) {
+                    const int remainingPct =
+                        100 - std::clamp(router.requestUsedPercent, 0, 100);
+                    t += bar(remainingPct);
+                    t += L"  ";
+                    t += std::to_wstring(router.requestsToday);
+                    t += L"/";
+                    t += std::to_wstring(router.freeDailyLimit);
+                    // UTC 零点重置 is 08:00 local here, not local midnight.
+                    t += L" (UTC)";
+                } else {
+                    t += std::to_wstring(router.freeDailyLimit);
+                    t += L" \u6B21/\u5929\uFF08\u9700 ManagementKey\uFF09";
+                }
+                wchar_t money[64];
+                swprintf_s(money, L"  \u00B7  $%.2f", router.balance);
+                t += money;
+                if (router.balance < opts.orLowBalanceUsd) {
+                    t += L" [!]";
+                }
+                t += L"\n";
+            } else {
+                t += L" OpenRouter [!] \u672A\u83B7\u53D6\n";  // 未获取
+            }
+        }
+
+        if (opts.showOpenCodeGo) {
+            if (go.success && go.source == "server") {
+                // Server-side percentages — identical to the opencode.ai
+                // console's rollingUsage/weeklyUsage/monthlyUsage. The bar
+                // mirrors the ring: the higher of the weekly/monthly used %,
+                // falling back to the 5h window when both are unavailable.
+                int ringIdx = -1;   // 0 = 5h, 1 = weekly, 2 = monthly
+                int ringUsed = -1;
+                long long ringReset = -1;
+                if (go.weekly.usedPercent >= 0) {
+                    ringUsed = std::clamp(go.weekly.usedPercent, 0, 100);
+                    ringReset = go.weekly.resetInSec;
+                    ringIdx = 1;
+                }
+                if (go.monthly.usedPercent >= 0
+                    && go.monthly.status != "unlimited"
+                    && std::clamp(go.monthly.usedPercent, 0, 100) > ringUsed) {
+                    ringUsed = std::clamp(go.monthly.usedPercent, 0, 100);
+                    ringReset = go.monthly.resetInSec;
+                    ringIdx = 2;
+                }
+                if (ringUsed < 0 && go.rolling.usedPercent >= 0) {
+                    ringUsed = std::clamp(go.rolling.usedPercent, 0, 100);
+                    ringReset = go.rolling.resetInSec;
+                    ringIdx = 0;
+                }
+                if (ringUsed < 0) {
+                    t += L" Go [!] ";
+                    t += go.errorMessage.empty()
+                        ? L"\u65E0\u7528\u91CF\u8BB0\u5F55"  // 无用量记录
+                        : go.errorMessage;
+                    t += L"\n";
+                } else {
+                    const int remaining = 100 - ringUsed;
+                    const wchar_t* ringLabel = ringIdx == 2
+                        ? L" Go \u6708  "                       // 月
+                        : ringIdx == 1 ? L" Go \u5468  "       // 周
+                                       : L" Go 5h  ";
+                    t += ringLabel + bar(remaining);
+                    t += L" " + std::to_wstring(remaining) + L"%";
+                    if (go.weekly.usedPercent >= 0) {
+                        t += L"  \u00B7  \u5468 ";  // 周
+                        t += std::to_wstring(std::clamp(go.weekly.usedPercent, 0, 100));
+                        t += L"%";
+                    }
+                    if (go.monthly.usedPercent >= 0
+                        && go.monthly.status != "unlimited") {
+                        t += L"  \u00B7  \u6708 ";  // 月
+                        t += std::to_wstring(std::clamp(go.monthly.usedPercent, 0, 100));
+                        t += L"%";
+                    }
+                    if (go.rolling.usedPercent >= 0) {
+                        t += L"  \u00B7  5h ";  // 5h
+                        t += std::to_wstring(std::clamp(go.rolling.usedPercent, 0, 100));
+                        t += L"%";
+                    }
+                    if (ringReset > 0) {
+                        const long long s = ringReset;
+                        wchar_t resetBuf[24];
+                        if (s >= 86400)
+                            swprintf_s(resetBuf, L"%lldd%02lldh", s / 86400, (s % 86400) / 3600);
+                        else if (s >= 3600)
+                            swprintf_s(resetBuf, L"%lldh%02lldm", s / 3600, (s % 3600) / 60);
+                        else
+                            swprintf_s(resetBuf, L"%lldm", std::max<long long>(1, s / 60));
+                        t += L"  \u00B7  \u91CD\u7F6E ";  // 重置
+                        t += resetBuf;
+                    }
+                    t += L"\n";
+                }
+            } else if (go.success && go.source == "local" && go.hasGoUsage) {
+                // Local-DB estimate (no browser cookie configured). The
+                // ring/bar rule matches the server path: higher of the
+                // weekly/monthly used %, falling back to the 5h window.
+                const int weekUsed = go.costWeek > 0
+                    ? std::clamp(static_cast<int>(std::lround(
+                        go.costWeek / OpenCodeGoUsageFetcher::kCapWeek
+                            * 100.0)), 0, 100) : -1;
+                const int monthUsed = go.costMonth > 0
+                    ? std::clamp(static_cast<int>(std::lround(
+                        go.costMonth / OpenCodeGoUsageFetcher::kCapMonth
+                            * 100.0)), 0, 100) : -1;
+                int ringUsed = std::max(weekUsed, monthUsed);
+                std::wstring ringLabel = L" Go \u5468  ";  // 周
+                if (ringUsed < 0) {
+                    ringUsed = go.localPct5h >= 0
+                        ? std::clamp(100 - go.localPct5h, 0, 100) : 0;
+                    ringLabel = L" Go 5h  ";
+                } else if (monthUsed > weekUsed) {
+                    ringLabel = L" Go \u6708  ";  // 月
+                }
+                const int remaining = 100 - ringUsed;
+                t += ringLabel + bar(remaining);
+                t += L" " + std::to_wstring(remaining) + L"%  ";
+                wchar_t goBuf[96];
+                swprintf_s(goBuf, L"$%.1f/$12 \u5468 $%.1f \u6708 $%.1f \uFF08\u672C\u573A\u4F30\u7B97\uFF09",
+                           go.cost5h, go.costWeek, go.costMonth);
+                t += goBuf;
+                t += L"\n";
+            } else {
+                t += L" Go [!] ";
+                t += go.errorMessage.empty()
+                    ? L"\u65E0\u7528\u91CF\u8BB0\u5F55"  // 无用量记录
+                    : go.errorMessage;
+                t += L"\n";
+            }
         }
 
         if (dash_.GetOptions().showResetRadar) {
@@ -2085,7 +3037,11 @@ private:
                 t += L"\n";
             }
             if (x.resetRadar.updatedAtUnixSeconds > 0) {
-                t += L"\u66F4\u65B0  ";
+                t += (!x.resetRadar.runwayPrimary
+                      && x.resetRadar.summaryWindowOpen
+                      && !x.resetRadar.forecastWindowOpen)
+                    ? L"\u5F00\u542F  "
+                    : L"\u66F4\u65B0  ";
                 t += UnixToLocalDateTimeW(
                     x.resetRadar.updatedAtUnixSeconds);
                 t += L"\n";
@@ -2122,7 +3078,7 @@ private:
             t += L"Reset credits  "
                 + x.resetCredits.errorMessage + L"\n";
         }
-        if (c.success && c.usedCredits > 0) {
+        if (opts.showCredits && c.success && c.usedCredits > 0) {
             const double amount =
                 c.usedCredits / pow(10.0, c.decimalPlaces);
             wchar_t buffer[32];
@@ -2164,8 +3120,18 @@ private:
         if (!ag.errorMessage.empty()) {
             t += L" [!] Antigravity  " + ag.errorMessage + L"\n";
         }
+        if (!router.errorMessage.empty()) {
+            t += L" [!] OpenRouter  " + router.errorMessage + L"\n";
+        }
+        if (!router.analyticsError.empty()) {
+            t += L" [!] OpenRouter Analytics  "
+                 + router.analyticsError + L"\n";
+        }
         if (!kiro.errorMessage.empty()) {
             t += L" [!] Kiro  " + kiro.errorMessage + L"\n";
+        }
+        if (!go.errorMessage.empty()) {
+            t += L" [!] OpenCode Go  " + go.errorMessage + L"\n";
         }
         if (!x.resetRadar.errorMessage.empty()) {
             t += L" [!] \u91CD\u7F6E\u6E90  "; // 重置源
@@ -2183,10 +3149,25 @@ private:
     }
 
     AIDashboardItem dash_;
+    agentstatus::AgentLightItem coworkLight_{
+        false, L"AIUsageCoworkLight", L"Claude Cowork Status"};
+    agentstatus::AgentLightItem codeLight_{
+        true, L"AIUsageCodeLight", L"Claude Code Status"};
+    // The status scan is filesystem-only and must not share the fetch worker:
+    // a stalled network request would otherwise freeze the lights for minutes.
+    std::thread statusWorker_;
+    std::atomic<bool> statusExited_{false};
+    std::atomic<bool> statusStarted_{false};
+    mutable std::mutex statusMu_;
+    agentstatus::WatcherConfig watcherCfg_;
+    agentstatus::LightOptions lightOpts_;
+    std::wstring statusTip_;
     ClaudeUsageFetcher claude_;
     CodexUsageFetcher codex_;
     AntigravityUsageFetcher ag_;
     KiroCreditsFetcher kiro_;
+    OpenCodeGoUsageFetcher go_;
+    OpenRouterUsageFetcher router_;
     ProxyConfig proxyConfig_;
     std::wstring configDir_;
     mutable std::mutex mu_;
@@ -2202,6 +3183,10 @@ private:
     std::thread worker_;
     std::atomic<bool> workerExited_{false};
     std::chrono::steady_clock::time_point lastFetch_{};
+    std::chrono::steady_clock::time_point lastClaudeExport_{};
+    std::wstring lastClaudeExportPath_;
+    int lastClaudeExportMinutes_ = 10;
+    std::string lastClaudeExportStatus_;
     static constexpr std::chrono::minutes interval_{1};
 };
 

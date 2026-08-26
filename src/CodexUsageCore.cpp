@@ -16,6 +16,9 @@ namespace {
 
 constexpr int kFiveHourWindowSeconds = 5 * 60 * 60;
 constexpr int kWeeklyWindowSeconds = 7 * 24 * 60 * 60;
+constexpr long long kMaximumSummaryWindowAgeSeconds = 72 * 60 * 60;
+constexpr long long kMaximumCommunityFetchAgeSeconds = 2 * 60 * 60;
+constexpr long long kMaximumFutureClockSkewSeconds = 5 * 60;
 
 bool ExtractWindow(const jsonlite::Value* windowNode, UsageWindow* output) {
     if (windowNode == nullptr || output == nullptr) {
@@ -190,6 +193,21 @@ void AssignWindowByDuration(const UsageWindow& window, UsageSnapshot* snapshot) 
 
 }  // namespace
 
+std::wstring TruncateTooltip(const std::wstring& text, size_t maxChars) {
+    if (maxChars == 0 || text.size() <= maxChars) return text;
+
+    // … (已截断)
+    const std::wstring marker = L" \u2026 (\u5DF2\u622A\u65AD)\n";
+    if (maxChars <= marker.size()) return text.substr(0, maxChars);
+
+    const size_t budget = maxChars - marker.size();
+    const size_t lastLine = text.rfind(L'\n', budget);
+    std::wstring out = text.substr(
+        0, lastLine == std::wstring::npos ? budget : lastLine + 1);
+    out += marker;
+    return out;
+}
+
 std::wstring Utf8ToWide(const std::string& input) {
     if (input.empty()) {
         return {};
@@ -333,22 +351,80 @@ ResetRadarSnapshot ParseResetRadarSummaryJson(
         return snapshot;
     }
 
-    snapshot.summaryWindowOpen = *open;
-    snapshot.windowOpen = *open;
-    if (auto updated = ReadTimestamp(
-            &*root, "monitored_at", "monitoredAt"); updated.has_value()) {
-        snapshot.updatedAtUnixSeconds = *updated;
+    const jsonlite::Value* window = root->Find("window");
+    const jsonlite::Value* nestedOpenNode =
+        window != nullptr ? window->Find("open") : nullptr;
+    const auto nestedOpen =
+        nestedOpenNode != nullptr ? nestedOpenNode->AsBool() : std::nullopt;
+    if (*open && (window == nullptr || !nestedOpen.has_value())) {
+        SetParseError(errorMessage, L"open radar summary is missing window.open");
+        return snapshot;
+    }
+    if (nestedOpen.has_value() && *nestedOpen != *open) {
+        SetParseError(errorMessage, L"radar summary open fields disagree");
+        return snapshot;
     }
 
-    const jsonlite::Value* window = root->Find("window");
+    const auto topStatus = ReadString(&*root, "status");
+    const auto nestedStatus = ReadString(window, "status");
+    const auto statusAgrees = [open](const std::optional<std::string>& status) {
+        if (!status.has_value()) return true;
+        if (*status != "open" && *status != "closed") return false;
+        return (*status == "open") == *open;
+    };
+    if (!statusAgrees(topStatus) || !statusAgrees(nestedStatus)) {
+        SetParseError(errorMessage, L"radar summary status fields disagree");
+        return snapshot;
+    }
+
     if (auto opened = ReadTimestamp(
             window, "opened_at", "openedAt"); opened.has_value()) {
         snapshot.openedAtUnixSeconds = *opened;
     }
+    if (*open && snapshot.openedAtUnixSeconds <= 0) {
+        SetParseError(errorMessage, L"open radar summary is missing opened_at");
+        return snapshot;
+    }
+
+    const jsonlite::Value* closedNode =
+        FindEither(window, "closed_at", "closedAt");
+    if (closedNode != nullptr && !closedNode->IsNull()) {
+        const auto closed = ReadTimestamp(window, "closed_at", "closedAt");
+        if (!closed.has_value()) {
+            SetParseError(errorMessage, L"radar summary closed_at is invalid");
+            return snapshot;
+        }
+        snapshot.closedAtUnixSeconds = *closed;
+    }
+    if (snapshot.closedAtUnixSeconds > 0
+        && (snapshot.openedAtUnixSeconds <= 0
+            || snapshot.closedAtUnixSeconds < snapshot.openedAtUnixSeconds)) {
+        SetParseError(errorMessage, L"radar summary window timestamps are invalid");
+        return snapshot;
+    }
+    if (*open && snapshot.closedAtUnixSeconds > 0) {
+        SetParseError(errorMessage, L"closed radar window cannot remain open");
+        return snapshot;
+    }
+
+    // monitored_at is intentionally not used. The public summary currently
+    // publishes values older than opened_at, so it cannot establish whether
+    // a window is still live. Window lifecycle plus the local successful
+    // fetch time are validated when snapshots are merged.
+    snapshot.summaryWindowOpen = *open;
+    snapshot.windowOpen = *open;
+    snapshot.updatedAtUnixSeconds = *open
+        ? snapshot.openedAtUnixSeconds
+        : snapshot.closedAtUnixSeconds;
     snapshot.message = ReadWideString(window, "message");
 
     const jsonlite::Value* prediction = root->Find("prediction");
     if (prediction != nullptr) {
+        if (auto predictionUpdated = ReadTimestamp(
+                prediction, "updated_at", "updatedAt");
+            predictionUpdated.has_value()) {
+            snapshot.probabilityUpdatedAtUnixSeconds = *predictionUpdated;
+        }
         if (const jsonlite::Value* probability = prediction->Find("probability_24h");
             probability != nullptr) {
             if (auto value = probability->AsNumber(); value.has_value()) {
@@ -399,6 +475,7 @@ ResetRadarSnapshot ParseResetForecastJson(
     if (auto updated = ReadTimestamp(
             &*root, "updated_at", "updatedAt"); updated.has_value()) {
         snapshot.updatedAtUnixSeconds = *updated;
+        snapshot.probabilityUpdatedAtUnixSeconds = *updated;
     }
     if (officialSignal->IsObject()) {
         if (auto opened = ReadTimestamp(
@@ -725,7 +802,11 @@ ResetRadarSnapshot ParseCodexRunwayResetStatusJson(
     } else {
         snapshot.todayState = ResetTodayState::No;
     }
-    snapshot.windowOpen = snapshot.todayState == ResetTodayState::Yes;
+    // windowOpen 只认"今天还有尚未生效的预定重置"。已完成的重置
+    // （reset_completed，或已到生效时间的 reset_scheduled）视为窗口已
+    // 关闭，避免重置完成后闪电一整天不灭。todayState 保留原语义（今日
+    // 是否有重置活动）供 tooltip 展示。
+    snapshot.windowOpen = nextScheduleIsToday;
 
     int primaryEventIndex = latestEventIndex;
     if (snapshot.todayState == ResetTodayState::Yes) {
@@ -766,48 +847,102 @@ ResetRadarSnapshot MergeResetRadarSnapshots(
     long long maximumSignalAgeSeconds) {
     ResetRadarSnapshot merged;
     merged.success = summary.success || forecast.success;
-    merged.checkedAtUnixSeconds = nowUnixSeconds;
+    merged.checkedAtUnixSeconds = std::max(
+        summary.checkedAtUnixSeconds, forecast.checkedAtUnixSeconds);
 
-    const auto isFresh = [&](const ResetRadarSnapshot& source) {
-        if (!source.success || source.updatedAtUnixSeconds <= 0) return false;
-        const long long age = nowUnixSeconds - source.updatedAtUnixSeconds;
-        return age >= -5 * 60 && age <= maximumSignalAgeSeconds;
+    const auto timestampIsRecent = [&](long long timestamp, long long maximumAge) {
+        if (timestamp <= 0) return false;
+        const long long age = nowUnixSeconds - timestamp;
+        return age >= -kMaximumFutureClockSkewSeconds && age <= maximumAge;
     };
-    const bool summaryFresh = isFresh(summary);
-    const bool forecastFresh = isFresh(forecast);
+    const auto fetchIsRecent = [&](const ResetRadarSnapshot& source) {
+        return source.success
+            && timestampIsRecent(
+                source.checkedAtUnixSeconds,
+                kMaximumCommunityFetchAgeSeconds);
+    };
 
-    merged.summaryWindowOpen =
-        summary.summaryWindowOpen && summaryFresh;
+    const bool summaryFetchRecent = fetchIsRecent(summary);
+    const bool summaryLifecycleOpen =
+        summary.summaryWindowOpen
+        && summary.closedAtUnixSeconds <= 0
+        && timestampIsRecent(
+            summary.openedAtUnixSeconds,
+            kMaximumSummaryWindowAgeSeconds);
+    const bool summaryOpen = summaryFetchRecent && summaryLifecycleOpen;
+
+    const bool embeddedForecastFresh =
+        summary.forecastWindowOpen
+        && summaryFetchRecent
+        && timestampIsRecent(
+            summary.updatedAtUnixSeconds, maximumSignalAgeSeconds);
+    const bool forecastFetchRecent = fetchIsRecent(forecast);
+    const bool forecastFresh =
+        forecast.forecastWindowOpen
+        && forecastFetchRecent
+        && timestampIsRecent(
+            forecast.updatedAtUnixSeconds, maximumSignalAgeSeconds);
+
+    merged.summaryWindowOpen = summaryOpen;
     merged.forecastWindowOpen =
-        (summary.forecastWindowOpen && summaryFresh)
-        || (forecast.forecastWindowOpen && forecastFresh);
+        embeddedForecastFresh || forecastFresh;
     merged.windowOpen = merged.summaryWindowOpen || merged.forecastWindowOpen;
-    merged.updatedAtUnixSeconds = std::max(
-        summary.updatedAtUnixSeconds, forecast.updatedAtUnixSeconds);
+    if (summaryOpen) {
+        merged.updatedAtUnixSeconds = summary.openedAtUnixSeconds;
+        merged.closedAtUnixSeconds = summary.closedAtUnixSeconds;
+    }
+    if (summaryFetchRecent && summary.updatedAtUnixSeconds > 0) {
+        merged.updatedAtUnixSeconds = std::max(
+            merged.updatedAtUnixSeconds, summary.updatedAtUnixSeconds);
+    }
+    if (forecastFetchRecent
+        && forecast.updatedAtUnixSeconds > 0
+        && (!summaryOpen || forecastFresh)) {
+        merged.updatedAtUnixSeconds = std::max(
+            merged.updatedAtUnixSeconds, forecast.updatedAtUnixSeconds);
+    }
     merged.openedAtUnixSeconds =
-        forecast.forecastWindowOpen && forecastFresh
+        forecastFresh
         ? forecast.openedAtUnixSeconds
         : (merged.summaryWindowOpen ? summary.openedAtUnixSeconds : 0);
-    if (summary.forecastWindowOpen && summaryFresh) {
+    if (embeddedForecastFresh) {
         merged.openedAtUnixSeconds = summary.openedAtUnixSeconds;
     }
 
-    if (forecast.probability24h >= 0) {
+    const bool forecastProbabilityFresh =
+        forecastFetchRecent
+        && timestampIsRecent(
+            forecast.probabilityUpdatedAtUnixSeconds,
+            maximumSignalAgeSeconds);
+    const bool summaryProbabilityFresh =
+        summaryFetchRecent
+        && timestampIsRecent(
+            summary.probabilityUpdatedAtUnixSeconds,
+            maximumSignalAgeSeconds);
+    if (forecastProbabilityFresh && forecast.probability24h >= 0) {
         merged.probability24h = forecast.probability24h;
-    } else {
+        merged.probabilityUpdatedAtUnixSeconds =
+            forecast.probabilityUpdatedAtUnixSeconds;
+    } else if (summaryProbabilityFresh) {
         merged.probability24h = summary.probability24h;
     }
-    if (forecast.probability48h >= 0) {
+    if (forecastProbabilityFresh && forecast.probability48h >= 0) {
         merged.probability48h = forecast.probability48h;
-    } else {
+        merged.probabilityUpdatedAtUnixSeconds =
+            forecast.probabilityUpdatedAtUnixSeconds;
+    } else if (summaryProbabilityFresh) {
         merged.probability48h = summary.probability48h;
     }
-    if (forecast.forecastWindowOpen
-        && forecastFresh
+    if (merged.probabilityUpdatedAtUnixSeconds <= 0
+        && summaryProbabilityFresh) {
+        merged.probabilityUpdatedAtUnixSeconds =
+            summary.probabilityUpdatedAtUnixSeconds;
+    }
+    if (forecastFresh
         && !forecast.message.empty()) {
         merged.message = forecast.message;
     } else if (summary.forecastWindowOpen
-               && summaryFresh
+               && embeddedForecastFresh
                && !summary.message.empty()) {
         merged.message = summary.message;
     } else if (merged.summaryWindowOpen && !summary.message.empty()) {
@@ -820,14 +955,15 @@ ResetRadarSnapshot MergeResetRadarSnapshots(
             if (!merged.errorMessage.empty()) merged.errorMessage += L"; ";
             merged.errorMessage += forecast.errorMessage;
         }
-    } else if ((summary.windowOpen && !summaryFresh)
+    } else if ((summary.summaryWindowOpen && !summaryOpen)
+               || (summary.forecastWindowOpen && !embeddedForecastFresh)
                || (forecast.windowOpen && !forecastFresh)) {
-        merged.errorMessage = L"stale reset-window signal ignored";
+        merged.errorMessage = L"invalid or expired reset-window signal ignored";
     }
     return merged;
 }
 
-ResetRadarSnapshot MergeResetRadarSnapshots(
+ResetRadarSnapshot MergeResetRadarSnapshotsWithRunway(
     const ResetRadarSnapshot& runway,
     const ResetRadarSnapshot& summary,
     const ResetRadarSnapshot& forecast,
@@ -837,7 +973,8 @@ ResetRadarSnapshot MergeResetRadarSnapshots(
         summary, forecast, nowUnixSeconds, maximumSignalAgeSeconds);
     merged.success = merged.success || runway.success;
     merged.runwaySourceAvailable = runway.runwaySourceAvailable;
-    merged.checkedAtUnixSeconds = nowUnixSeconds;
+    merged.checkedAtUnixSeconds = std::max(
+        merged.checkedAtUnixSeconds, runway.checkedAtUnixSeconds);
 
     if (runway.runwaySourceAvailable) {
         merged.todayState = runway.todayState;
@@ -861,8 +998,9 @@ ResetRadarSnapshot MergeResetRadarSnapshots(
         && runwayAge <= 30 * 60 * 60;
     if (runwayFresh && runway.todayState != ResetTodayState::Unknown) {
         merged.runwayPrimary = true;
-        merged.windowOpen =
-            runway.todayState == ResetTodayState::Yes;
+        // 采用 runway 自身的窗口判定（nextScheduleIsToday），而非
+        // todayState==Yes：今日已完成的重置不应让窗口继续打开。
+        merged.windowOpen = runway.windowOpen;
         merged.updatedAtUnixSeconds = runway.updatedAtUnixSeconds;
         merged.openedAtUnixSeconds =
             runway.openedAtUnixSeconds;
@@ -1031,6 +1169,71 @@ std::wstring FormatIsoDateAsMonthDay(const std::string& text) {
     if (day < 1 || day > maxDay) return L"--";
 
     return std::to_wstring(month) + L"." + std::to_wstring(day);
+}
+
+namespace {
+int DaysInMonth(int year, int month) {
+    static constexpr int table[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    int days = table[month - 1];
+    const bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    if (month == 2 && leap) days = 29;
+    return days;
+}
+}  // namespace
+
+// Rolls a manually-seeded "YYYY-MM-DD" subscription anchor date forward by
+// whole cycles (monthly/yearly) until it lands on or after today, so a date
+// entered once (e.g. from an App Store receipt) keeps showing the next real
+// renewal without ever being edited again. Unknown/empty cycle values are a
+// no-op: the anchor is returned unchanged, matching the old static-date
+// behavior.
+std::string AdvanceExpiryToFuture(
+    const std::string& anchorDate, const std::string& cycle,
+    int todayYear, int todayMonth, int todayDay) {
+    if (anchorDate.size() != 10 || anchorDate[4] != '-' || anchorDate[7] != '-') {
+        return anchorDate;
+    }
+    for (size_t i = 0; i < anchorDate.size(); ++i) {
+        if (i == 4 || i == 7) continue;
+        if (anchorDate[i] < '0' || anchorDate[i] > '9') return anchorDate;
+    }
+
+    const int stepMonths = (cycle == "yearly") ? 12 : (cycle == "monthly") ? 1 : 0;
+    if (stepMonths == 0) return anchorDate;
+
+    int year = std::stoi(anchorDate.substr(0, 4));
+    int month = std::stoi(anchorDate.substr(5, 2));
+    const int anchorDay = std::stoi(anchorDate.substr(8, 2));
+    if (month < 1 || month > 12 || anchorDay < 1
+        || anchorDay > DaysInMonth(year, month)) {
+        return anchorDate;
+    }
+
+    // Recomputed each check instead of carried forward, so a short-month
+    // clamp (Jan 31 -> Feb 28) does not permanently shrink later months
+    // that do have the anchor day (Feb 28 -> Mar 31, not Mar 28).
+    const auto effectiveDay = [&](int y, int m) {
+        return std::min(anchorDay, DaysInMonth(y, m));
+    };
+    const auto isBeforeToday = [&](int y, int m, int d) {
+        if (y != todayYear) return y < todayYear;
+        if (m != todayMonth) return m < todayMonth;
+        return d < todayDay;
+    };
+
+    int guard = 0;
+    while (isBeforeToday(year, month, effectiveDay(year, month))
+           && guard++ < 2400) {
+        month += stepMonths;
+        while (month > 12) {
+            month -= 12;
+            ++year;
+        }
+    }
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d", year, month, effectiveDay(year, month));
+    return std::string(buf);
 }
 
 FreshnessLevel ClassifyFreshnessForDisplay(double ageSeconds, bool refreshInProgress) {

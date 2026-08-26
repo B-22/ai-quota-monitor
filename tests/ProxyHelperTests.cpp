@@ -54,6 +54,23 @@ int main() {
     }
 
     {
+        const ProxyConfig httpProxy = DetectProxy(
+            L"  http://127.0.0.1:7890/  ", false);
+        Expect(httpProxy.explicitProxy == L"127.0.0.1:7890",
+            "HTTP proxy URLs must be normalized for WinHTTP");
+        const ProxyConfig httpsProxy = DetectProxy(
+            L"HTTPS://proxy.example:443", false);
+        Expect(httpsProxy.explicitProxy == L"proxy.example:443",
+            "HTTPS proxy URLs must be normalized case-insensitively");
+        const ProxyConfig protocolMap = DetectProxy(
+            L"http=proxy.example:80;https=proxy.example:443", false);
+        Expect(
+            protocolMap.explicitProxy
+                == L"http=proxy.example:80;https=proxy.example:443",
+            "WinHTTP protocol maps must remain unchanged");
+    }
+
+    {
         const std::wstring trace =
             L"fl=abc\r\nh=chatgpt.com\r\n"
             L"ip=2001:db8::443\r\nloc=ZZ\r\n";

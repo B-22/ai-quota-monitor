@@ -6,6 +6,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <map>
 #include <mutex>
@@ -525,12 +526,16 @@ void DashboardRenderer::DrawGradientTextAt(
     const wchar_t* fontFamily,
     float fontSizePx,
     bool mediumWeight,
-    bool darkMode) {
+    bool darkMode,
+    COLORREF customStart,
+    COLORREF customEnd) {
     if (!impl_ || !text || !*text) return;
-    const COLORREF start =
-        darkMode ? RGB(255, 209, 102) : RGB(132, 20, 48);
-    const COLORREF end =
-        darkMode ? RGB(255, 94, 168) : RGB(82, 28, 128);
+    const COLORREF start = customStart != CLR_INVALID
+        ? customStart
+        : (darkMode ? RGB(255, 209, 102) : RGB(132, 20, 48));
+    const COLORREF end = customEnd != CLR_INVALID
+        ? customEnd
+        : (darkMode ? RGB(255, 94, 168) : RGB(82, 28, 128));
 
     if (impl_->directWrite) {
         const ComPtr<IDWriteTextLayout> layout =
@@ -590,6 +595,75 @@ void DashboardRenderer::DrawGradientTextAt(
         format.GetFormatFlags() | Gdiplus::StringFormatFlagsNoWrap);
     impl_->gdi->DrawString(
         text, -1, &font, Gdiplus::PointF(x, y), &format, &brush);
+}
+
+void DashboardRenderer::DrawLightning(
+    float left,
+    float top,
+    float width,
+    float height,
+    COLORREF startColor,
+    COLORREF endColor) {
+    if (!impl_ || width <= 0.0f || height <= 0.0f) return;
+
+    // A compact SVG-like bolt: top tip, left shoulder, inner notch, bottom
+    // tip, right shoulder, and the upper inner notch. The proportions are
+    // intentionally broad so the mark remains legible at 32px taskbar height.
+    constexpr std::array<D2D1_POINT_2F, 6> kBolt = {{
+        {0.58f, 0.04f},
+        {0.17f, 0.54f},
+        {0.44f, 0.54f},
+        {0.38f, 0.96f},
+        {0.83f, 0.46f},
+        {0.56f, 0.46f},
+    }};
+    const auto pointAt = [&](const D2D1_POINT_2F& point) {
+        return impl_->LocalPoint(
+            left + point.x * width,
+            top + point.y * height);
+    };
+
+    if (impl_->directWrite) {
+        ComPtr<ID2D1PathGeometry> geometry;
+        if (FAILED(Shared().d2dFactory->CreatePathGeometry(&geometry))) return;
+        ComPtr<ID2D1GeometrySink> sink;
+        if (FAILED(geometry->Open(&sink))) return;
+        sink->BeginFigure(pointAt(kBolt[0]), D2D1_FIGURE_BEGIN_FILLED);
+        for (size_t i = 1; i < kBolt.size(); ++i) {
+            sink->AddLine(pointAt(kBolt[i]));
+        }
+        sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        if (FAILED(sink->Close())) return;
+
+        D2D1_GRADIENT_STOP stops[2]{
+            {0.0f, ToD2DColor(startColor)},
+            {1.0f, ToD2DColor(endColor)}};
+        ComPtr<ID2D1GradientStopCollection> collection;
+        if (FAILED(impl_->target->CreateGradientStopCollection(
+                stops, 2, &collection))) return;
+        ComPtr<ID2D1LinearGradientBrush> brush;
+        const D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES properties{
+            impl_->LocalPoint(left, top),
+            impl_->LocalPoint(left + width, top + height)};
+        if (FAILED(impl_->target->CreateLinearGradientBrush(
+                properties, collection.Get(), &brush))) return;
+        impl_->target->FillGeometry(geometry.Get(), brush.Get());
+        return;
+    }
+
+    if (!impl_->gdi) return;
+    Gdiplus::PointF points[kBolt.size()];
+    for (size_t i = 0; i < kBolt.size(); ++i) {
+        points[i] = Gdiplus::PointF(
+            left + kBolt[i].x * width,
+            top + kBolt[i].y * height);
+    }
+    Gdiplus::LinearGradientBrush brush(
+        Gdiplus::RectF(left, top, width, height),
+        ToGdiPlusColor(startColor),
+        ToGdiPlusColor(endColor),
+        Gdiplus::LinearGradientModeForwardDiagonal);
+    impl_->gdi->FillPolygon(&brush, points, static_cast<INT>(kBolt.size()));
 }
 
 void DashboardRenderer::DrawTextCentered(
@@ -670,6 +744,45 @@ void DashboardRenderer::DrawFreshnessUnderline(
         y,
         color,
         stroke);
+}
+
+void DashboardRenderer::FillRoundRect(
+    float left,
+    float top,
+    float right,
+    float bottom,
+    float radius,
+    COLORREF color) {
+    if (!impl_) return;
+    if (right <= left || bottom <= top) return;
+    // A radius past half the shorter side would invert the corner arcs.
+    const float r = std::min(
+        radius, std::min(right - left, bottom - top) / 2.0f);
+
+    if (impl_->directWrite) {
+        impl_->SetBrush(color);
+        impl_->target->FillRoundedRectangle(
+            D2D1::RoundedRect(
+                impl_->LocalRect(left, top, right, bottom), r, r),
+            impl_->solidBrush.Get());
+        return;
+    }
+    if (!impl_->gdi) return;
+
+    Gdiplus::SolidBrush brush(ToGdiPlusColor(color));
+    if (r <= 0.5f) {
+        impl_->gdi->FillRectangle(
+            &brush, left, top, right - left, bottom - top);
+        return;
+    }
+    const float d = r * 2.0f;
+    Gdiplus::GraphicsPath path;
+    path.AddArc(left, top, d, d, 180.0f, 90.0f);
+    path.AddArc(right - d, top, d, d, 270.0f, 90.0f);
+    path.AddArc(right - d, bottom - d, d, d, 0.0f, 90.0f);
+    path.AddArc(left, bottom - d, d, d, 90.0f, 90.0f);
+    path.CloseFigure();
+    impl_->gdi->FillPath(&brush, &path);
 }
 
 void DashboardRenderer::DrawDot(

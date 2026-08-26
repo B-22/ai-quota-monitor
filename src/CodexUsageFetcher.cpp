@@ -94,9 +94,20 @@ std::optional<std::string> HttpGetJson(const ProxyConfig& proxyConfig,
             timeoutMilliseconds,
             timeoutMilliseconds);
 
-        if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+        BOOL requestSent = WinHttpSendRequest(
+            request,
+            WINHTTP_NO_ADDITIONAL_HEADERS,
+            0,
+            WINHTTP_NO_REQUEST_DATA,
+            0,
+            0,
+            0);
+        DWORD sendError = requestSent ? ERROR_SUCCESS : GetLastError();
+
+        if (!requestSent) {
             if (errorMessage != nullptr) {
-                *errorMessage = L"WinHttpSendRequest failed";
+                *errorMessage = L"WinHttpSendRequest failed ("
+                    + std::to_wstring(sendError) + L")";
             }
             break;
         }
@@ -176,7 +187,7 @@ void CodexUsageFetcher::SetRadarRefreshMinutes(int minutes) {
 }
 
 void CodexUsageFetcher::SetResetTodayRefreshMinutes(int minutes) {
-    resetTodayRefreshMinutes_ = std::clamp(minutes, 15, 240);
+    resetTodayRefreshMinutes_ = std::clamp(minutes, 5, 240);
     lastResetTodayFetch_ = {};
 }
 
@@ -421,7 +432,11 @@ ResetRadarSnapshot CodexUsageFetcher::FetchResetRadar() const {
             5000);
         if (summaryJson.has_value()) {
             summary = ParseResetRadarSummaryJson(*summaryJson, &error);
-            if (!summary.success) summary.errorMessage = error;
+            if (summary.success) {
+                summary.checkedAtUnixSeconds = nowUnix;
+            } else {
+                summary.errorMessage = error;
+            }
         } else {
             summary.errorMessage = error;
         }
@@ -437,7 +452,11 @@ ResetRadarSnapshot CodexUsageFetcher::FetchResetRadar() const {
             5000);
         if (forecastJson.has_value()) {
             forecast = ParseResetForecastJson(*forecastJson, &error);
-            if (!forecast.success) forecast.errorMessage = error;
+            if (forecast.success) {
+                forecast.checkedAtUnixSeconds = nowUnix;
+            } else {
+                forecast.errorMessage = error;
+            }
         } else {
             forecast.errorMessage = error;
         }
@@ -445,7 +464,7 @@ ResetRadarSnapshot CodexUsageFetcher::FetchResetRadar() const {
             MergeResetRadarSnapshots(summary, forecast, nowUnix);
     }
 
-    ResetRadarSnapshot merged = MergeResetRadarSnapshots(
+    ResetRadarSnapshot merged = MergeResetRadarSnapshotsWithRunway(
         runway, cachedCommunityRadar_, {}, nowUnix);
     if (merged.success) {
         cachedRadar_ = merged;
@@ -455,8 +474,12 @@ ResetRadarSnapshot CodexUsageFetcher::FetchResetRadar() const {
     if (cachedRadar_.success) {
         ResetRadarSnapshot cached = cachedRadar_;
         cached.checkedAtUnixSeconds = nowUnix;
-        if (cached.updatedAtUnixSeconds <= 0
-            || nowUnix - cached.updatedAtUnixSeconds > 12 * 60 * 60) {
+        const long long lastSuccessfulFetch =
+            cachedRadar_.checkedAtUnixSeconds;
+        const long long fetchAge = nowUnix - lastSuccessfulFetch;
+        if (lastSuccessfulFetch <= 0
+            || fetchAge < -5 * 60
+            || fetchAge > 2 * 60 * 60) {
             cached.windowOpen = false;
             cached.summaryWindowOpen = false;
             cached.forecastWindowOpen = false;

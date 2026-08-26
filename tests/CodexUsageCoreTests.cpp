@@ -1,5 +1,7 @@
 #include "CodexUsageCore.h"
 #include "CodexUsageVersion.h"
+#include "ClaudeUsageParser.h"
+#include "ClaudeUsageExport.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -24,6 +26,27 @@ void AssertEqual(int actual, int expected, const char* message) {
 void AssertEqual(const std::wstring& actual, const std::wstring& expected, const char* message) {
     if (actual != expected) {
         std::wcerr << message << L": expected [" << expected << L"], got [" << actual << L"]\n";
+        std::exit(1);
+    }
+}
+
+void AssertEqual(
+    const std::string& actual,
+    const std::string& expected,
+    const char* message) {
+    if (actual != expected) {
+        std::cerr << message << ": expected [" << expected
+                  << "], got [" << actual << "]\n";
+        std::exit(1);
+    }
+}
+
+void AssertContains(
+    const std::string& actual,
+    const std::string& expected,
+    const char* message) {
+    if (actual.find(expected) == std::string::npos) {
+        std::cerr << message << ": missing [" << expected << "]\n";
         std::exit(1);
     }
 }
@@ -90,6 +113,162 @@ void ClassifiesPrimaryWindowWithoutSecondaryWindow() {
         "tooltip should mark missing five-hour window unavailable");
 }
 
+void ParsesOptionalClaudeFableWindow() {
+    const std::string json = R"json({
+        "five_hour": {
+            "utilization": 12,
+            "resets_at": "2026-08-21T06:00:00Z"
+        },
+        "seven_day": {
+            "utilization": 34,
+            "resets_at": "2026-08-25T06:00:00Z"
+        },
+        "limits": [
+            {
+                "kind": "weekly_scoped",
+                "group": "weekly",
+                "percent": 47,
+                "resets_at": "2026-08-25T06:00:00Z",
+                "scope": {
+                    "model": {"id": null, "display_name": "Fable 5"},
+                    "surface": null
+                }
+            },
+            {
+                "kind": "weekly_scoped",
+                "group": "weekly",
+                "percent": 81,
+                "resets_at": null,
+                "scope": {
+                    "model": {"display_name": "Sonnet"}
+                }
+            }
+        ]
+    })json";
+
+    std::wstring error;
+    const ClaudeUsageData data = ParseClaudeUsageJson(json, &error);
+    AssertTrue(data.success, "Claude usage response should parse");
+    AssertTrue(error.empty(), "valid Claude usage should not set an error");
+    AssertEqual(data.fiveHourPercent, 12, "Claude five-hour used percent");
+    AssertEqual(data.sevenDayPercent, 34, "Claude weekly used percent");
+    AssertEqual(data.fableWeeklyPercent, 47, "Fable weekly used percent");
+    AssertTrue(
+        data.fableWeeklyResetAt == "2026-08-25T06:00:00Z",
+        "Fable reset timestamp should parse");
+}
+
+void HidesClaudeFableWindowWhenPlanDoesNotReportIt() {
+    const std::string json = R"json({
+        "limits": [
+            {"kind":"session","percent":5,"resets_at":null},
+            {"kind":"weekly_all","percent":9,"resets_at":null}
+        ]
+    })json";
+
+    const ClaudeUsageData data = ParseClaudeUsageJson(json);
+    AssertTrue(data.success, "Claude limits array should parse");
+    AssertEqual(data.fiveHourPercent, 5, "nullable session reset should not hide usage");
+    AssertEqual(data.sevenDayPercent, 9, "nullable weekly reset should not hide usage");
+    AssertEqual(data.fableWeeklyPercent, -1, "missing Fable bucket should stay unavailable");
+}
+
+void ParsesLegacyClaudeFableWindow() {
+    const std::string json = R"json({
+        "seven_day_overage_included": {
+            "utilization": 63,
+            "resets_at": "2026-08-26T00:00:00Z"
+        }
+    })json";
+
+    const ClaudeUsageData data = ParseClaudeUsageJson(json);
+    AssertTrue(data.success, "legacy Claude Fable response should parse");
+    AssertEqual(data.fableWeeklyPercent, 63, "legacy Fable used percent");
+}
+
+void BuildsSanitizedClaudeUsageExport() {
+    ClaudeUsageData data;
+    data.success = true;
+    data.lastSuccessTime = 1000;
+    data.fiveHourPercent = 38;
+    data.sevenDayPercent = 73;
+    data.fableWeeklyPercent = 63;
+
+    AssertEqual(
+        ClassifyClaudeUsageExportStatus(data, 1100),
+        std::string("ok"),
+        "fresh Claude export status");
+    AssertTrue(
+        ShouldWriteClaudeUsageExport(-1, 10, "ok", ""),
+        "first export should write immediately");
+    AssertTrue(
+        !ShouldWriteClaudeUsageExport(599, 10, "ok", "ok"),
+        "ten-minute export should not write early");
+    AssertTrue(
+        ShouldWriteClaudeUsageExport(600, 10, "ok", "ok"),
+        "ten-minute export should write at the boundary");
+    AssertTrue(
+        ShouldWriteClaudeUsageExport(30, 10, "stale", "ok"),
+        "status changes should write immediately");
+
+    ClaudeUsageExportRecord record;
+    record.status = "ok";
+    record.generatedAtUnix = 1100;
+    record.generatedAtLocal = "2026-08-21 17:00";
+    record.sourceFetchedAtUnix = 1000;
+    record.sourceAgeSeconds = 100;
+    record.refreshIntervalMinutes = 10;
+    record.fiveHourUsedPercent = 38;
+    record.fiveHourResetUtc = "2026-08-21T10:00:00Z";
+    record.fiveHourResetLocal = "2026-08-21 18:00";
+    record.sevenDayUsedPercent = 73;
+    record.sevenDayResetUtc = "2026-08-25T06:00:00Z";
+    record.sevenDayResetLocal = "2026-08-25 14:00";
+    record.fableWeeklyUsedPercent = 63;
+
+    const std::string text = BuildClaudeUsageExportText(record);
+    AssertContains(text, "status=ok", "export status");
+    AssertContains(text, "refresh_interval_minutes=10", "export interval");
+    AssertContains(
+        text,
+        "[claude_5h]\navailable=1\nused_percent=38\nremaining_percent=62",
+        "five-hour export");
+    AssertContains(
+        text,
+        "[claude_7d]\navailable=1\nused_percent=73\nremaining_percent=27",
+        "weekly export");
+    AssertContains(
+        text,
+        "reset_at_local=2026-08-25 14:00",
+        "weekly local reset");
+    AssertContains(
+        text,
+        "[claude_fable_7d]\navailable=1\nused_percent=63\nremaining_percent=37",
+        "Fable export");
+    AssertTrue(
+        text.find("token=") == std::string::npos,
+        "export must not contain a token field");
+    AssertTrue(
+        text.find("credits=") == std::string::npos,
+        "export must not contain Credits data");
+
+    data.errorMessage = L"cached after fetch error";
+    AssertEqual(
+        ClassifyClaudeUsageExportStatus(data, 1100),
+        std::string("stale"),
+        "cached error should mark export stale");
+    data.errorMessage.clear();
+    AssertEqual(
+        ClassifyClaudeUsageExportStatus(data, 2000),
+        std::string("stale"),
+        "old Claude export status");
+    data.success = false;
+    AssertEqual(
+        ClassifyClaudeUsageExportStatus(data, 1100),
+        std::string("unavailable"),
+        "failed Claude export status");
+}
+
 void FormatsDisplayText() {
     AssertEqual(FormatRemainingPercent(77), L"77%", "remaining percent text");
     AssertEqual(FormatRemainingPercent(-1), L"--", "negative percent text");
@@ -103,6 +282,41 @@ void FormatsDisplayText() {
     AssertEqual(
         FormatIsoDateAsMonthDay("2024-02-29"), L"2.29",
         "leap-day subscription expiry should be accepted");
+}
+
+void AdvancesSubscriptionExpiryToNextCycle() {
+    AssertEqual(
+        Utf8ToWide(AdvanceExpiryToFuture("2026-09-16", "monthly", 2026, 8, 26)),
+        Utf8ToWide("2026-09-16"),
+        "anchor still in the future should be returned unchanged");
+    AssertEqual(
+        Utf8ToWide(AdvanceExpiryToFuture("2026-08-16", "monthly", 2026, 8, 26)),
+        Utf8ToWide("2026-09-16"),
+        "past monthly anchor should roll forward exactly one cycle");
+    AssertEqual(
+        Utf8ToWide(AdvanceExpiryToFuture("2026-01-16", "monthly", 2026, 8, 26)),
+        Utf8ToWide("2026-09-16"),
+        "many-cycles-stale monthly anchor should catch up to the next occurrence");
+    AssertEqual(
+        Utf8ToWide(AdvanceExpiryToFuture("2026-01-31", "monthly", 2026, 3, 15)),
+        Utf8ToWide("2026-03-31"),
+        "short-February clamp should not permanently shrink later months");
+    AssertEqual(
+        Utf8ToWide(AdvanceExpiryToFuture("2025-09-16", "yearly", 2026, 8, 26)),
+        Utf8ToWide("2026-09-16"),
+        "past yearly anchor should roll forward exactly one cycle");
+    AssertEqual(
+        Utf8ToWide(AdvanceExpiryToFuture("2026-08-26", "monthly", 2026, 8, 26)),
+        Utf8ToWide("2026-08-26"),
+        "anchor equal to today should not roll forward yet");
+    AssertEqual(
+        Utf8ToWide(AdvanceExpiryToFuture("2026-08-16", "", 2026, 8, 26)),
+        Utf8ToWide("2026-08-16"),
+        "empty cycle should behave like the old static date, unchanged");
+    AssertEqual(
+        Utf8ToWide(AdvanceExpiryToFuture("bad-date", "monthly", 2026, 8, 26)),
+        Utf8ToWide("bad-date"),
+        "malformed anchor should be returned unchanged rather than throw");
 }
 
 void ParsesIso8601Timestamps() {
@@ -212,15 +426,21 @@ void ParsesResetCreditsAndExpiryWarning() {
 }
 
 void ParsesAndMergesResetRadarSignals() {
+    const long long now =
+        *ParseIso8601UtcSeconds("2026-07-30T00:10:00Z");
     const std::string summaryJson = R"json({
-        "monitored_at": "2026-07-30T08:00:00+08:00",
+        "monitored_at": "2026-07-22T06:57:20+08:00",
         "window_open": true,
+        "status": "open",
         "window": {
             "open": true,
+            "status": "open",
             "message": "Lands in the next hour",
-            "opened_at": "2026-07-30T07:50:00+08:00"
+            "opened_at": "2026-07-30T07:50:00+08:00",
+            "closed_at": null
         },
         "prediction": {
+            "updated_at": "2026-07-30T00:04:00Z",
             "probability_24h": 0.55,
             "probability_48h": 0.75
         }
@@ -254,18 +474,22 @@ void ParsesAndMergesResetRadarSignals() {
     })json";
 
     std::wstring error;
-    const ResetRadarSnapshot summary =
+    ResetRadarSnapshot summary =
         ParseResetRadarSummaryJson(summaryJson, &error);
-    const ResetRadarSnapshot quiet =
+    ResetRadarSnapshot quiet =
         ParseResetForecastJson(quietForecastJson, &error);
-    const ResetRadarSnapshot active =
+    ResetRadarSnapshot active =
         ParseResetForecastJson(activeForecastJson, &error);
     const ResetRadarSnapshot malformedSignal =
         ParseResetForecastJson(malformedSignalForecastJson, &error);
-    const long long now =
-        *ParseIso8601UtcSeconds("2026-07-30T00:10:00Z");
+    summary.checkedAtUnixSeconds = now;
+    quiet.checkedAtUnixSeconds = now;
+    active.checkedAtUnixSeconds = now;
 
     AssertTrue(summary.success, "radar summary should parse");
+    AssertTrue(
+        summary.updatedAtUnixSeconds == summary.openedAtUnixSeconds,
+        "broken monitored_at must not become the summary signal time");
     AssertTrue(quiet.success, "quiet reset forecast should parse");
     AssertTrue(active.success, "active reset forecast should parse");
     AssertTrue(!quiet.forecastWindowOpen, "null official signal should be quiet");
@@ -279,6 +503,15 @@ void ParsesAndMergesResetRadarSignals() {
     AssertTrue(merged.windowOpen, "fresh summary signal should open merged window");
     AssertEqual(merged.probability24h, 15, "forecast probability should win");
     AssertEqual(merged.probability48h, 30, "forecast 48h probability should win");
+
+    const ResetRadarSnapshot mergedWithEmptyRunway =
+        MergeResetRadarSnapshotsWithRunway({}, merged, {}, now);
+    AssertTrue(
+        mergedWithEmptyRunway.windowOpen,
+        "an empty Runway source must not discard an open community window");
+    AssertTrue(
+        mergedWithEmptyRunway.summaryWindowOpen,
+        "community summary state must survive the three-source merge");
 
     const ResetRadarSnapshot activeMerged =
         MergeResetRadarSnapshots({}, active, now);
@@ -295,7 +528,65 @@ void ParsesAndMergesResetRadarSignals() {
         MergeResetRadarSnapshots(summary, active, staleNow);
     AssertTrue(
         !stale.windowOpen,
-        "signals older than the maximum age should be ignored");
+        "signals without a recent successful fetch should be ignored");
+
+    ResetRadarSnapshot refreshedSummary = summary;
+    refreshedSummary.checkedAtUnixSeconds = staleNow;
+    const ResetRadarSnapshot longRunningWindow =
+        MergeResetRadarSnapshots(refreshedSummary, {}, staleNow);
+    AssertTrue(
+        longRunningWindow.windowOpen,
+        "an explicitly open summary may remain active beyond 12 hours");
+
+    const long long expiredNow = now + 73 * 60 * 60;
+    refreshedSummary.checkedAtUnixSeconds = expiredNow;
+    const ResetRadarSnapshot expiredWindow =
+        MergeResetRadarSnapshots(refreshedSummary, {}, expiredNow);
+    AssertTrue(
+        !expiredWindow.windowOpen,
+        "an unclosed summary window must expire after the lifecycle cap");
+
+    const std::string contradictorySummaryJson = R"json({
+        "monitored_at": "2026-07-22T06:57:20+08:00",
+        "window_open": true,
+        "status": "open",
+        "window": {
+            "open": true,
+            "status": "open",
+            "opened_at": "2026-07-30T07:50:00+08:00",
+            "closed_at": "2026-07-30T08:00:00+08:00"
+        }
+    })json";
+    const ResetRadarSnapshot contradictory =
+        ParseResetRadarSummaryJson(contradictorySummaryJson, &error);
+    AssertTrue(
+        !contradictory.success,
+        "closed_at must override contradictory open flags");
+
+    const std::string mismatchedSummaryJson = R"json({
+        "window_open": true,
+        "status": "open",
+        "window": {
+            "open": false,
+            "status": "closed",
+            "opened_at": "2026-07-30T07:50:00+08:00",
+            "closed_at": null
+        }
+    })json";
+    const ResetRadarSnapshot mismatched =
+        ParseResetRadarSummaryJson(mismatchedSummaryJson, &error);
+    AssertTrue(
+        !mismatched.success,
+        "top-level and nested window states must agree");
+
+    ResetRadarSnapshot futureSummary = summary;
+    futureSummary.checkedAtUnixSeconds = now;
+    futureSummary.openedAtUnixSeconds = now + 10 * 60;
+    const ResetRadarSnapshot futureWindow =
+        MergeResetRadarSnapshots(futureSummary, {}, now);
+    AssertTrue(
+        !futureWindow.windowOpen,
+        "a window opened too far in the future must be ignored");
 }
 
 void ParsesCodexRunwayResetTodayFeed() {
@@ -331,10 +622,11 @@ void ParsesCodexRunwayResetTodayFeed() {
     const ResetRadarSnapshot completed =
         ParseCodexRunwayResetStatusJson(completedJson, now, &error);
     AssertTrue(completed.success, "Runway feed should parse");
-    AssertTrue(
-        completed.todayState == ResetTodayState::Yes,
+    AssertTrue(completed.todayState == ResetTodayState::Yes,
         "same-day completed reset should resolve to yes");
-    AssertTrue(completed.windowOpen, "Runway yes should open reset window");
+    AssertTrue(
+        !completed.windowOpen,
+        "same-day completed reset should close the reset window");
     AssertEqual(completed.confidencePercent, 90, "Runway confidence");
     AssertEqual(
         completed.evidenceUrl,
@@ -343,6 +635,38 @@ void ParsesCodexRunwayResetTodayFeed() {
     AssertTrue(
         completed.latestResetAtUnixSeconds == now,
         "completed reset timestamp should be preserved");
+
+    const std::string scheduledJson = R"json({
+        "schemaVersion": 1,
+        "generatedAt": "2026-07-31T12:00:00Z",
+        "lastSuccessfulCheckAt": "2026-07-31T12:00:00Z",
+        "monitor": {
+            "status": "ok",
+            "errorCode": null
+        },
+        "events": [{
+            "kind": "reset_scheduled",
+            "announcedAt": "2026-07-31T10:00:00Z",
+            "effectiveAt": "2026-07-31T14:00:00Z",
+            "confidence": 0.8,
+            "rationale": "Explicit Codex quota reset schedule.",
+            "source": {
+                "handle": "thsottiaux",
+                "postId": "1951234567890123457",
+                "url": "https://x.com/thsottiaux/status/1951234567890123457"
+            },
+            "scope": {
+                "plans": ["all"],
+                "windows": ["weekly"]
+            }
+        }]
+    })json";
+    const ResetRadarSnapshot scheduled =
+        ParseCodexRunwayResetStatusJson(scheduledJson, now, &error);
+    AssertTrue(scheduled.success, "scheduled Runway feed should parse");
+    AssertTrue(
+        scheduled.windowOpen,
+        "pending same-day schedule should open the reset window");
 
     const std::string quietJson = R"json({
         "schemaVersion": 1,
@@ -367,8 +691,10 @@ void ParsesCodexRunwayResetTodayFeed() {
     forecast.forecastWindowOpen = true;
     forecast.probability24h = 88;
     forecast.updatedAtUnixSeconds = now;
+    forecast.probabilityUpdatedAtUnixSeconds = now;
+    forecast.checkedAtUnixSeconds = now;
     const ResetRadarSnapshot merged =
-        MergeResetRadarSnapshots(quiet, {}, forecast, now);
+        MergeResetRadarSnapshotsWithRunway(quiet, {}, forecast, now);
     AssertTrue(
         merged.runwayPrimary,
         "fresh conclusive Runway state should be primary");
@@ -407,12 +733,69 @@ void HasGeneratedVersion() {
     AssertTrue(std::wstring(CODEX_USAGE_VERSION_WIDE).size() > 0, "generated version should not be empty");
 }
 
+// The taskbar host rejects a tooltip past ~810 characters with a
+// "遇到不适当的参数" message box and no log entry, so the ceiling is
+// enforced in code. What matters here is that enforcing it never
+// produces a half-written line: a tip ending in "余额 $9." reads as
+// corrupt data, while an explicit truncation marker reads as a setting.
+void TestTruncateTooltipKeepsShortTextIntact() {
+    const std::wstring tip = L" Claude  5h  80%\n Codex  7d  20%\n";
+    AssertTrue(TruncateTooltip(tip, 780) == tip,
+               "short tooltip is returned unchanged");
+}
+
+void TestTruncateTooltipHonoursTheCap() {
+    std::wstring tip;
+    for (int i = 0; i < 60; ++i) {
+        tip += L" provider line with a number 12345/67890\n";
+    }
+    AssertTrue(tip.size() > 780, "fixture is long enough to be cut");
+    const std::wstring out = TruncateTooltip(tip, 780);
+    AssertTrue(out.size() <= 780,
+               "truncated tooltip must not exceed the cap");
+}
+
+void TestTruncateTooltipCutsOnALineBoundary() {
+    std::wstring tip;
+    for (int i = 0; i < 60; ++i) {
+        tip += L" provider line with a number 12345/67890\n";
+    }
+    const std::wstring out = TruncateTooltip(tip, 780);
+    const std::wstring marker = L" \u2026 (\u5DF2\u622A\u65AD)\n";
+    AssertTrue(out.size() > marker.size(), "output carries the marker");
+    AssertTrue(
+        out.compare(out.size() - marker.size(), marker.size(), marker) == 0,
+        "truncation is announced with the marker");
+    // The character before the marker must close a line, never sit
+    // mid-number.
+    AssertTrue(out[out.size() - marker.size() - 1] == L'\n',
+               "the cut lands on a line boundary");
+}
+
+void TestTruncateTooltipHandlesNoNewline() {
+    // One enormous line with nowhere to cut cleanly still has to obey
+    // the cap, otherwise the host rejects it anyway.
+    const std::wstring tip(2000, L'x');
+    const std::wstring out = TruncateTooltip(tip, 780);
+    AssertTrue(out.size() <= 780,
+               "a single long line is still capped");
+}
+
 }  // namespace
 
 int main() {
+    TestTruncateTooltipKeepsShortTextIntact();
+    TestTruncateTooltipHonoursTheCap();
+    TestTruncateTooltipCutsOnALineBoundary();
+    TestTruncateTooltipHandlesNoNewline();
     ParsesUsageWindows();
     ClassifiesPrimaryWindowWithoutSecondaryWindow();
+    ParsesOptionalClaudeFableWindow();
+    HidesClaudeFableWindowWhenPlanDoesNotReportIt();
+    ParsesLegacyClaudeFableWindow();
+    BuildsSanitizedClaudeUsageExport();
     FormatsDisplayText();
+    AdvancesSubscriptionExpiryToNextCycle();
     ParsesIso8601Timestamps();
     ClassifiesFreshnessAndCountdownWindow();
     BuildsMultiLineSuccessTooltip();

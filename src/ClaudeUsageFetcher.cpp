@@ -387,11 +387,11 @@ ClaudeUsageData ClaudeUsageFetcher::Fetch() {
 
     // Parse response
     backoffSeconds_ = 0;
-    jsonlite::Parser parser(*response);
-    auto root = parser.Parse();
-    if (!root) {
-        ClaudeUsageData err;
-        err.errorMessage = L"JSON parse failed";
+    std::wstring parseError;
+    ClaudeUsageData data = ParseClaudeUsageJson(*response, &parseError);
+    if (!data.success) {
+        ClaudeUsageData err = data;
+        if (err.errorMessage.empty()) err.errorMessage = parseError;
         if (cachedData_.success) {
             ClaudeUsageData stale = cachedData_;
             stale.errorMessage = err.errorMessage;
@@ -400,87 +400,7 @@ ClaudeUsageData ClaudeUsageFetcher::Fetch() {
         return err;
     }
 
-    ClaudeUsageData data;
-    data.success = true;
     data.lastSuccessTime = now;
-
-    // Parse top-level windows (legacy format)
-    auto* fiveHour = root->Find("five_hour");
-    if (fiveHour) {
-        auto* util = fiveHour->Find("utilization");
-        auto* resetAt = fiveHour->Find("resets_at");
-        if (util) {
-            auto val = util->AsNumber();
-            if (val) data.fiveHourPercent = static_cast<int>(std::round(*val));
-        }
-        if (resetAt && resetAt->IsString()) {
-            auto rs = resetAt->AsString();
-            if (rs) data.fiveHourResetAt = std::string(*rs);
-        }
-    }
-
-    auto* sevenDay = root->Find("seven_day");
-    if (sevenDay) {
-        auto* util = sevenDay->Find("utilization");
-        auto* resetAt = sevenDay->Find("resets_at");
-        if (util) {
-            auto val = util->AsNumber();
-            if (val) data.sevenDayPercent = static_cast<int>(std::round(*val));
-        }
-        if (resetAt && resetAt->IsString()) {
-            auto rs = resetAt->AsString();
-            if (rs) data.sevenDayResetAt = std::string(*rs);
-        }
-    }
-
-    // Parse limits array (new API format)
-    auto* limits = root->Find("limits");
-    if (limits && limits->IsArray()) {
-        auto* arr = limits->AsArray();
-        if (arr) {
-            for (const auto& entry : *arr) {
-                auto* kind = entry.Find("kind");
-                auto* percent = entry.Find("percent");
-                auto* resetsAt = entry.Find("resets_at");
-                if (!kind || !percent || !resetsAt) continue;
-                auto kindStr = kind->AsString();
-                auto pctVal = percent->AsNumber();
-                auto resetStr = resetsAt->AsString();
-                if (!kindStr || !pctVal || !resetStr) continue;
-
-                int pct = static_cast<int>(std::round(*pctVal));
-                std::string reset = std::string(*resetStr);
-
-                if (*kindStr == "session" && data.fiveHourPercent < 0) {
-                    data.fiveHourPercent = pct;
-                    data.fiveHourResetAt = reset;
-                } else if (*kindStr == "weekly_all" && data.sevenDayPercent < 0) {
-                    data.sevenDayPercent = pct;
-                    data.sevenDayResetAt = reset;
-                }
-            }
-        }
-    }
-
-    // Parse extra_usage (credits/overage)
-    auto* extraUsage = root->Find("extra_usage");
-    if (extraUsage && extraUsage->IsObject()) {
-        auto* usedCredits = extraUsage->Find("used_credits");
-        if (usedCredits) {
-            auto val = usedCredits->AsNumber();
-            if (val) data.usedCredits = static_cast<long long>(*val);
-        }
-        auto* cur = extraUsage->Find("currency");
-        if (cur && cur->IsString()) {
-            auto s = cur->AsString();
-            if (s) data.currency = std::string(*s);
-        }
-        auto* dp = extraUsage->Find("decimal_places");
-        if (dp) {
-            auto val = dp->AsNumber();
-            if (val) data.decimalPlaces = static_cast<int>(*val);
-        }
-    }
 
     // Fetch profile once for subscription status (to avoid extra API calls)
     if (!profileFetched_ && !auth.accessToken.empty()) {

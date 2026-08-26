@@ -44,7 +44,7 @@ private:
     mutable ProxyConfig proxyConfig_;
     mutable bool radarEnabled_ = true;
     mutable int radarRefreshMinutes_ = 15;
-    mutable int resetTodayRefreshMinutes_ = 60;
+    mutable int resetTodayRefreshMinutes_ = 5;
     mutable std::chrono::steady_clock::time_point lastRadarFetch_{};
     mutable std::chrono::steady_clock::time_point lastResetTodayFetch_{};
     mutable std::string cachedRunwayJson_;

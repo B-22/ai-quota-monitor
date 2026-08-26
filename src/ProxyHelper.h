@@ -22,9 +22,13 @@ ProxyConfig DetectProxy(const std::wstring& explicitProxy, bool requireProxy,
 
 // Create an HTTP session with appropriate proxy settings. When a policy check
 // fails, returns nullptr and writes a human-readable reason to errorMessage.
+// verifyExitIp=false skips the AllowedExitIPs egress check (used for
+// low-sensitivity lookups such as the OpenCode Go usage console, whose egress
+// varies with the proxy node and would otherwise fail closed constantly).
 HINTERNET OpenHttpSession(const ProxyConfig& config, const wchar_t* userAgent,
                           const wchar_t* targetHost = nullptr,
-                          std::wstring* errorMessage = nullptr);
+                          std::wstring* errorMessage = nullptr,
+                          bool verifyExitIp = true);
 
 // Validate the public exit IP through the same target-domain routing policy.
 bool VerifyExitIp(const ProxyConfig& config, const wchar_t* targetHost,

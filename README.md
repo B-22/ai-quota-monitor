@@ -1,6 +1,6 @@
 # AIUsage — TrafficMonitor Plugin
 
-TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显示 Claude、Codex、Antigravity 的用量/配额和 Kiro Credits 额度。
+TrafficMonitor x64 任务栏插件，以环形仪表 + 信息块方式实时显示 Claude（含账户可用时的 Fable 独立周额度）、Codex、Antigravity 的用量/配额和 Kiro Credits 额度。
 
 Windows 11 的视觉语言以 50 像素高的
 [`taskbar_preview.html`](docs/design/taskbar_preview.html) 为设计源：字号、字重、
@@ -90,16 +90,21 @@ TrafficMonitor 在插件左侧另有约 10 像素宿主间距，不计入上述�
   深红到紫色渐变；过期预警优先于 7d 倒计时、新鲜度分钟数和星期。
 - “今日是否全局重置”以 [Codex Runway](https://github.com/Licoy/codex-runway) 的
   匿名静态 v1 feed `https://codexreset.gitcdn.top/api/status.json` 为主基准，默认每
-  60 分钟刷新。插件会严格校验 schema、监控状态、事件类型、置信度、固定说明、
+  5 分钟刷新。插件会严格校验 schema、监控状态、事件类型、置信度、固定说明、
   `@thsottiaux` 证据链接和适用范围，再按本机日期判断“是 / 否 / 未知”。同日已完成
   重置或同日未来计划为“是”；30 小时未成功更新、监控降级或存在无法确认的同日事件
   时 fail-to-unknown，不把旧信息继续当作确定结论。
 - [codex-reset.com 的公开 forecast API](https://codex-reset.com/api/forecast) 和
   [Codex 雷达公开摘要](https://codex-reset-radar.pages.dev/current.json) 仍每
   15 分钟刷新，作为次级补充，保留 24/48 小时概率。Runway 有新鲜且明确的“是/否”
-  时优先；Runway 不可用或为“未知”时，次级来源才决定公告窗口。次级开启信号超过
-  12 小时会被忽略。
-- 主源判断为“是”或主源未知而次级公告窗口开启时，四个圆环左侧出现渐变闪电 `⚡`。
+  时优先；Runway 不可用或为“未知”时，次级来源才决定公告窗口。forecast 的公告和
+  概率各自按其 `updated_at` 校验 12 小时有效期；雷达摘要不再使用不可靠的
+  `monitored_at`，改为要求顶层与 `window` 内的开关/状态一致、`closed_at` 为空、
+  `opened_at` 不在未来且不超过 72 小时，并要求最近 2 小时内实际成功拉取过该摘要。
+- 主源判定“今日还有未生效的预定重置”（窗口预告）时，或主源未知而次级公告窗口
+  开启时，用量圆环组左侧出现较大的高亮黄橙至洋红渐变闪电 `⚡`，并与圆环垂直居中。
+  同日重置已完成（`reset_completed`，或预定重置已到生效时间）视为窗口已关闭，不再
+  亮灯；主源“今日是否重置”的结论（是/否/未知）仍显示在悬浮提示中。
   原生悬浮提示按“配额 / 今日全局重置 / 账户 / 状态”分段，显示主源结论、计划或最近
   重置时间、范围、置信度、补充概率、更新时间、重置卡和网络状态。
 - 雷达和概率均来自独立社区站点，只能作为提醒，不能保证 OpenAI 一定重置，也不能替代
@@ -112,7 +117,7 @@ ShowResetCreditWarning=1    # 1=在 Codex 星期栏显示临期卡
 ResetCreditWarningHours=48  # 最早可用卡进入多少小时后开始警告
 ShowResetRadar=1            # 1=监控全局“速蹬窗口”
 ResetRadarRefreshMinutes=15 # 允许 5-120 分钟
-RunwayResetRefreshMinutes=60 # 主源刷新，允许 15-240 分钟
+RunwayResetRefreshMinutes=5  # 主源刷新，允许 5-240 分钟
 ```
 
 Codex 用量和重置卡接口继续复用插件现有的代理与出口 IP 检查；启用
@@ -120,8 +125,160 @@ Codex 用量和重置卡接口继续复用插件现有的代理与出口 IP 检�
 重置接口是匿名公共数据，不发送 token、账号 ID 或 Cookie，因此不应用 `RequireProxy`
 和 `AllowedExitIPs` 限制，避免公共站点不支持目标域名出口检查时被误判为“IP 屏蔽”；
 如果已配置显式或系统代理，重置源仍沿用该代理路由。第三方源失败不会阻断
-Claude/Codex 用量数据；Runway 缓存会随当前日期重新求值，超过 30 小时只显示“未知”，
-次级开启信号只在 12 小时新鲜度范围内有效。
+Claude/Codex 用量数据；Runway 缓存会随当前日期重新求值，超过 30 小时只显示“未知”。
+雷达摘要的 `monitored_at` 仅存在于上游原始数据，不参与窗口判定；无法确认关闭状态、
+字段互相矛盾、超过 72 小时仍未关闭或超过 2 小时未成功重新拉取时均停止亮灯。
+
+## Cowork / Code 运行状态指示灯
+
+除用量仪表外，插件还提供两个**独立的任务栏显示项**，分别指示 Claude 桌面端
+两个标签页的运行状态：
+
+| 显示项名称 | 对应 |
+| --- | --- |
+| `Claude Cowork Status` | 桌面端 Cowork 标签页 |
+| `Claude Code Status` | 桌面端 Code 标签页 |
+
+它们在 TrafficMonitor「选项 → 显示设置」里作为普通显示项勾选、排序，可以只启用
+其中一个，也可以和用量仪表分开摆放。
+
+### 颜色与聚合规则
+
+| 颜色 | 含义 |
+| --- | --- |
+| 🔴 红 | 有会话在等待用户授权或提问 |
+| 🟡 黄 | 有会话正在执行 |
+| 🟢 绿 | 有活动会话，均已完成，等待输入 |
+| ⚪ 灰 | 无活动会话 |
+
+一盏灯代表**一整类**会话。同类有多个会话时按紧急度取最高的一个显示
+（红 > 黄 > 绿 > 灰），圆点右侧的数字是处于该状态的会话数，只有一个会话时不显示
+数字。因此"一个会话已完成、另一个仍在跑"显示为黄灯而非绿灯——灯要回答的是
+"我现在能不能撒手"，而不是"有没有东西完成了"；同理，任何一个会话弹出授权请求
+都会让灯变红，不会被其他正在忙的会话掩盖。
+
+鼠标悬停在插件上时，工具提示会在配额信息下方列出每个会话的状态和标题
+（最多 4 条）。
+
+### 摆放位置：画在仪表盘内部（默认）
+
+两盏灯默认作为一个**芯片组**画在用量仪表盘这一个显示项的末尾——一条竖线分隔，
+后面是浅灰圆角胶囊包住的 `● Cowork  ● Code`，与左侧信息块共用同一条基线。
+
+这样安排是被 TrafficMonitor 的布局规则逼出来的，值得记一笔：
+
+- TrafficMonitor 默认把显示项排成**两行**（官方 wiki：「通常情况下任务栏窗口中的项目
+  会以两行的格式显示」）。**两行模式的窗口更高**，插件拿到完整约 32 像素槽位，
+  仪表盘的圆环是满尺寸。
+- 选项里的「水平排列」（`horizontal_arrange = true`）改成单行后，每项只分到一行文字
+  的高度（约 20 像素），仪表盘会按槽位等比缩放，**圆环明显变小**。
+- 而两行模式下，独立的显示项会被排到第二行，正好被自绘满高的仪表盘盖住。
+
+把灯并进仪表盘同时避开了两个坑：圆环保持原尺寸，灯也在同一行同一基线。
+`LightsInsideDashboard=0` 可改回两个独立显示项。
+
+灯组本身对槽位高度自适应：圆点半径、字号、间距、胶囊内边距和圆角都按宿主传入的矩形
+高度换算，在半高槽位里自动缩小并保持垂直居中。
+
+**灯必须画在仪表盘内部，这不是审美选择。** TrafficMonitor 默认两行布局下每个显示项
+只分到窗口一半高度（约 16px），只有独占行对的项才拿到完整 32px，而插件 API 无法申请
+高度——所以决定高度的是**显示项数量**。把两盏灯注册成独立显示项会让仪表盘掉到半行，
+圆环缩一半、角标压住圆环、每个标签压住自己的数值。因此 `LightsInsideDashboard=1`
+（默认）时插件根本不注册那两项（`GetItem` 返回空），改成 `0` 需要重启 TrafficMonitor
+才会出现独立项。
+
+> 顺带修掉一个既有问题：仪表盘上报的宽度一直比实际绘制略窄（差值原先藏在右内边距里
+> 看不出来）。灯组排在最末尾时这个偏差会把尾部文字裁掉，因此现在每次绘制会把真实
+> 宽度记下来，上报 `max(估算值, 实测值)`，一帧之内收敛。
+
+宿主布局的完整踩坑记录、每条对应的回归测试，以及排查方法，见
+[`docs/taskbar-layout-pitfalls.md`](docs/taskbar-layout-pitfalls.md)。
+
+### 自动隐藏
+
+`Claude Code Status` 在超过 `AgentIdleTimeoutMinutes`（默认 30 分钟）没有活动会话
+时宽度收为 0，从任务栏消失，不占位置；新开 Code 会话后立即重新出现。该行为由
+`HideCodeLightWhenIdle` 控制。
+
+`Claude Cowork Status` **不参与自动隐藏**，无会话时常驻显示灰灯。
+
+### 数据来源与限制
+
+两个标签页的可观测性并不对称，实现方式也不同：
+
+**Cowork** 完全通过读文件实现，零侵入：
+
+```
+%APPDATA%\Claude\local-agent-mode-sessions\<账号>\<组织>  local_<uuid>.json          # 标题、lastActivityAt、isArchived
+  local_<uuid>udit.jsonl   # permission_request / permission_response
+  local_<uuid>\.claude\sessions\<pid>.json   # 当前轮次的 CLI 子进程
+```
+
+同时扫描第三方版 `%LOCALAPPDATA%\Claude-3p\...` 和应用商店 MSIX 版
+`%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\...`——MSIX 版的
+`%APPDATA%\Claude` 被虚拟化重定向，常规路径并不存在。
+
+**「工作中」以 `audit.jsonl` 为准。** Cowork 每结束一轮都会写入一条顶层
+`"type":"result"` 记录，因此"文件最后一条不是 result"就等于"这一轮还没跑完"。
+判定时只认记录**自身最外层**的 `type`：每条审计记录都内嵌了它所描述的助手消息，
+`type` 在同一行里会出现多次，直接做子串匹配会读到里层的值（模型正文里出现的
+引号 JSON 也会被误读）。
+
+Cowork 每一轮确实会启动一个短生命周期的 Claude CLI 子进程
+（`local_<uuid>\.claude\sessions\<pid>.json`），但它只作为**旁证**：确认进程存活
+需要 `OpenProcess` 句柄，而任务栏宿主 TrafficMonitor 以管理员身份运行、Claude CLI
+不是，实测宿主进程内始终拿不到句柄——一旦只靠进程判定，整轮对话灯都停在绿色。
+读文件没有这种不对称：等待状态（红灯）走的就是同一个 `audit.jsonl`，一直是正常的。
+
+桌面端如果在半路被关掉，那条 result 永远不会写入。因此还有一个宽限窗口
+`CoworkBusyGraceMinutes`（默认 10 分钟）：未完成的一轮超过这个时间没有新日志，
+就不再算「工作中」。实测单个工具调用造成的最长日志空档约 8 分钟，默认值留有余量。
+
+等待状态来自 `audit.jsonl` 中 `permission_request` 与
+`permission_response` 的 uuid 配对，是精确判定而非推测。
+
+> Cowork **无法使用 hooks**：它的每个会话运行在独立的临时配置目录下，
+> `~/.claude/settings.json` 里的 hooks 对它不生效
+> （[anthropics/claude-code#63360](https://github.com/anthropics/claude-code/issues/63360)，
+> 官方已 closed as not planned）。这也是 Cowork 必须走审计日志的原因。
+
+**Code** 的忙/闲同样只读文件：
+
+```
+%USERPROFILE%\.claude\sessions\<pid>.json        # entrypoint=claude-desktop
+%USERPROFILE%\.claude\projects\<slug>\<sid>.jsonl  # 最后一条 stop_reason
+```
+
+会话注册表会残留已退出会话的条目，因此成员资格由**进程存活**决定，并用
+`procStart`（进程创建时间）与 PID 一起校验，避免 Windows 复用 PID 造成误判。
+忙/闲取最后一条 assistant 记录的 `stop_reason`：`end_turn` 为空闲，其余
+（主要是 `tool_use`）为执行中。
+
+**Code 的红灯需要额外安装一个 hook。** 权限弹窗不会写入转录文件，只能由
+`PermissionRequest` hook 感知：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\install-code-status-hook.ps1 `
+    -ConfigDir "<TrafficMonitor 目录>"
+```
+
+该脚本向 `~/.claude/settings.json` 写入两个条目（`PermissionRequest` 与
+`SessionEnd`），首次运行前自动备份为 `settings.json.aiusage-backup`，写入前校验
+JSON 合法性，可重复运行不会产生重复条目，且不触碰用户已有的其他 hook 和设置。
+卸载：追加 `-Uninstall`。
+
+hook 只在权限弹窗出现时触发一次，向
+`<ConfigDir>gent-status\code\<session_id>.wait` 写一个空标记文件。插件仅在该
+标记**比转录文件更新**时才判定为等待——用户批准后工具开始执行、转录随即增长并
+越过标记，红灯自动熄灭。因此不需要在每次工具调用上再挂一个清理 hook。
+
+未安装 hook 时 Code 灯仍然正常区分黄/绿/灰，只是不会变红。
+
+### 开销
+
+状态扫描运行在独立线程（约 1.5 秒一轮），与用量拉取线程完全解耦，网络请求卡住
+不会冻结指示灯。归档和过期会话在**只读取目录元数据**的阶段就被 mtime 过滤掉，
+不会打开；`audit.jsonl` 只读取尾部 512 KB。
 
 ## 功能完整列表
 
@@ -131,6 +288,7 @@ Claude/Codex 用量数据；Runway 缓存会随当前日期重新求值，超过
 |------|------|------|
 | Claude 5h 用量 | `/api/oauth/usage` | 5 小时滑动窗口已用百分比 |
 | Claude 7d 用量 | `/api/oauth/usage` | 7 天窗口已用百分比 |
+| Claude Fable 周用量 | `/api/oauth/usage` `limits[]` | 可选的 `weekly_scoped` 模型额度；仅账户返回 Fable 时显示 |
 | Claude Credits | `/api/oauth/usage` `extra_usage` | 超额用量金额（$） |
 | Claude 5h 重置时间 | `/api/oauth/usage` `resets_at` | 下次 5h 窗口重置的本地时间 |
 | Claude 7d 重置时间 | `/api/oauth/usage` `resets_at` | 下次 7d 窗口重置日期 |
@@ -175,6 +333,7 @@ Kiro Credits 通过 Kiro IDE 的本地登录态读取，无需手动填凭据：
 |--------|--------|------|------|
 | Claude 5h 圆环 | 自动 | 始终显示 | 第一组 5h，用量色环和百分比数字 |
 | Claude 7d 圆环 | 自动 | 始终显示 | 第一组 7d，用量色环和百分比数字 |
+| Claude Fable 圆环 | 自动 | 按账户显示 | 第一组可选第三环；仅 `limits[]` 返回 Fable 模型周额度时出现，角标 `Fable` |
 | Codex 5h 圆环 | 自动 | 始终显示 | 第二组 5h，用量色环和百分比数字 |
 | Codex 7d 圆环 | 自动 | 始终显示 | 第二组 7d，用量色环和百分比数字 |
 | Antigravity 圆环 | `ShowAntigravity` | 显示 | 第三组，主模型已用百分比，角标 `AG` |
@@ -193,6 +352,7 @@ Kiro Credits 通过 Kiro IDE 的本地登录态读取，无需手动填凭据：
 | 全局重置标记 | `ShowResetRadar` | 显示 | 主源判断为“是”或主源未知且次级窗口开启时，在圆环左侧显示 `⚡` |
 | 新鲜度提示 | `ShowStatus` | 显示 | Claude/Codex 分别判断；1 分钟黄线，5 分钟红线 |
 | 自定义订阅日期 | `CustomSubExpiry` | 留空 | 可选的 `YYYY-MM-DD`，任务栏仅显示月日 |
+| 到期日自动续期 | `CustomSubExpiryCycle` | 留空 | `monthly`/`yearly`；设置后每次读配置都把 `CustomSubExpiry` 锚点自动推到下一个未过期日期，只需填一次真实续费日 |
 
 ### 圆环颜色逻辑
 
@@ -204,9 +364,10 @@ Kiro Credits 通过 Kiro IDE 的本地登录态读取，无需手动填凭据：
 | 90-100% | 红色，紧张 |
 | 无数据 | 灰色 |
 
-圆环颜色只表达用量等级，不再表达 Claude/Codex 来源。四个圆环固定按
-`Claude 5h、Claude 7d｜Codex 5h、Codex 7d` 排列，两组之间使用细分隔线，
-每个圆环右上角有 `5h` / `7d` 角标；槽位高度足够时每组下方还会显示来源名称
+圆环颜色只表达用量等级，不再表达 Claude/Codex 来源。基础圆环按
+`Claude 5h、Claude 7d｜Codex 5h、Codex 7d` 排列；账户返回 Fable 独立周额度时，
+Claude 组自动追加角标为 `Fable` 的第三环，没有该额度时不占宽度。两组之间使用细
+分隔线；槽位高度足够时每组下方还会显示来源名称
 （TrafficMonitor 的 32 像素槽位不足以显示，此时由信息区的 `Claude` / `Codex`
 两列区分）。因此在黑白或色觉差异环境中同样能区分来源。
 
@@ -310,6 +471,8 @@ VerifyTargetHostExitIp=1
 - 不修改或删除 Claude/Codex 官方凭据文件；Kiro 令牌缓存只读、不写回
 - Antigravity 的 OAuth 凭据只存在于本机 `AIUsage.ini`，不记录到 Git
 - Token 刷新沿用参考项目的安全写入方式
+- Claude 配额文本导出只包含百分比、重置时间和新鲜度状态，不包含账号、
+  Credits、账单数据、token 或 Cookie；采用同目录临时文件原子替换，避免读到半截内容
 
 ## 插件选项（AIUsage.ini）
 
@@ -322,6 +485,8 @@ VerifyTargetHostExitIp=1
 [AIUsage]
 ShowPctSign=0          # 圆环内是否显示 %
 ShowCredits=1          # 显示 Credits 金额
+ClaudeUsageExportPath= # 完整输出文件路径；留空关闭，模板不得填写个人路径
+ClaudeUsageExportMinutes=10 # 允许 1-1440 分钟
 ShowReset=1            # 显示 5h 重置时间
 ShowSubscription=0     # 隐藏 API 订阅状态
 ShowCustomExpiry=0     # 默认隐藏手动到期日期
@@ -334,7 +499,7 @@ ShowResetCreditWarning=1
 ResetCreditWarningHours=48
 ShowResetRadar=1
 ResetRadarRefreshMinutes=15
-RunwayResetRefreshMinutes=60
+RunwayResetRefreshMinutes=5
 ShowAntigravity=1        # 显示 Antigravity 圆环 + 档位块
 ShowKiro=1               # 显示 Kiro 圆环 + 剩余额度块
 CustomSubExpiry=       # 可选 YYYY-MM-DD；仓库模板必须留空
@@ -353,7 +518,28 @@ PrimaryModel=          # 主模型子串，留空自动选择
 
 [Kiro]                 # Kiro IDE 登录态
 TokenPath=             # 默认 %USERPROFILE%\.aws\sso\cache\kiro-auth-token.json
+
+[AgentStatus]          # Cowork / Code 运行状态指示灯
+ShowCoworkLight=1      # 显示 Cowork 指示灯
+ShowCodeLight=1        # 显示 Code 指示灯
+AgentIdleTimeoutMinutes=30  # 会话闲置多久不再计入（也决定 Code 灯何时隐藏），1-1440
+CoworkBusyGraceMinutes=10   # Cowork 未完成的一轮停止写日志多久后不再算工作中，1-120
+HideCodeLightWhenIdle=1     # Code 灯无会话时收为 0 宽度；Cowork 灯不受影响
+ShowAgentLightLabel=1  # 圆点旁显示 "Cowork" / "Code" 文字，0 = 只留圆点
+ShowAgentLightCount=1  # 会话多于 1 个时显示数量
+LightsInsideDashboard=1 # 灯画在仪表盘项内部（推荐）；0 = 两个独立显示项
+LightChip=1            # 灯组加浅灰圆角胶囊底；0 = 只显示圆点和文字
 ```
+
+Claude Fable 圆环无需配置键：插件从 `limits[]` 中识别 `weekly_scoped` 且
+`scope.model.display_name` 包含 `Fable` 的条目。该条目是可选的；套餐没有返回时
+圆环自动隐藏。若不需要 Claude Credits 金额块，将 `ShowCredits` 设为 `0`。
+
+设置 `ClaudeUsageExportPath` 后，插件会在首次获取、状态变化以及每个
+`ClaudeUsageExportMinutes` 周期，原子覆盖一份 UTF-8 INI 风格文本。文件包含
+`status=ok|stale|unavailable`、数据年龄、5h/7d 已用和剩余百分比、UTC 与本地
+重置时间；账号返回 Fable 桶时也会附带 `claude_fable_7d`。下游自动化应仅在
+`status=ok` 时使用额度，`stale` 或 `unavailable` 必须按额度不足处理。
 
 ## 构建
 
@@ -444,17 +630,27 @@ DLL、保留旧任务栏占位，并使新旧显示区域叠加或错位。本�
 │   ├── ProxyHelper.cpp/h          # 代理检测
 │   ├── AntigravityUsageFetcher.cpp/h  # Antigravity OAuth + 配额
 │   ├── KiroCreditsFetcher.cpp/h   # Kiro Credits 额度
+│   ├── AgentStatusWatcher.cpp/h   # Cowork/Code 会话状态扫描
+│   ├── AgentLightItems.cpp/h      # 两个指示灯显示项
 │   ├── JsonLite.cpp/h             # JSON 解析器
 │   └── CodexUsageVersion.h.in
 ├── tests/
 │   ├── CodexUsageCoreTests.cpp
+│   ├── AgentStatusTests.cpp       # 指示灯状态机与日志解析
+│   ├── AgentLightTests.cpp        # 灯组几何：量宽=实画、芯片、缩放
+│   ├── PluginLayoutTests.cpp      # 加载真实 DLL：显示项数量、上报宽度
 │   └── ProxyHelperTests.cpp
+├── tools/
+│   ├── install-code-status-hook.ps1  # 安装/卸载 Code 红灯所需的 hook
+│   └── deploy-agent-lights.ps1       # 自提权一键部署（停服务→换 DLL→装 hook→重启）
 └── server/                        # 可选 Go 转发服务（见“构建”一节）
     ├── main.go                    # HTTP 服务 + 上游转发 + 内存缓存
     ├── refresh.go                 # Claude token 刷新
     └── server_test.go             # 服务测试
 
-docs/                              # 设计稿
+docs/
+├── design/                        # 设计稿
+└── taskbar-layout-pitfalls.md     # 宿主布局踩坑记录 + 对应回归测试
 ```
 
 ## 协作与发布约束

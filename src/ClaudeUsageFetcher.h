@@ -1,28 +1,11 @@
 #pragma once
 
+#include "ClaudeUsageParser.h"
 #include "ProxyHelper.h"
 
 #include <optional>
 #include <string>
 #include <vector>
-
-struct ClaudeUsageData {
-    bool success = false;
-    std::wstring errorMessage;
-    int fiveHourPercent = -1;  // used percent
-    int sevenDayPercent = -1;
-    std::string fiveHourResetAt;  // ISO 8601 UTC
-    std::string sevenDayResetAt;
-    double lastSuccessTime = 0;  // Unix seconds
-
-    // Credits / overage
-    long long usedCredits = 0;   // raw integer from API
-    std::string currency;        // e.g., "USD"
-    int decimalPlaces = 2;
-
-    // Subscription
-    std::string subscriptionStatus; // "active", "canceled", etc.
-};
 
 class ClaudeUsageFetcher {
 public:

@@ -71,7 +71,20 @@ public:
         const wchar_t* fontFamily,
         float fontSizePx,
         bool mediumWeight,
-        bool darkMode);
+        bool darkMode,
+        COLORREF customStart = CLR_INVALID,
+        COLORREF customEnd = CLR_INVALID);
+
+    // Draw a taskbar-scale lightning mark from a fixed vector outline. This
+    // keeps the indicator independent of the installed symbol font's glyph
+    // shape and baseline.
+    void DrawLightning(
+        float left,
+        float top,
+        float width,
+        float height,
+        COLORREF startColor,
+        COLORREF endColor);
 
     void DrawTextCentered(
         const wchar_t* text,
@@ -99,6 +112,16 @@ public:
     void DrawDot(
         float centerX,
         float centerY,
+        float radius,
+        COLORREF color);
+
+    // Filled rounded rectangle, used as the container behind a chip-style
+    // group so it reads as a module rather than loose glyphs.
+    void FillRoundRect(
+        float left,
+        float top,
+        float right,
+        float bottom,
         float radius,
         COLORREF color);
 
