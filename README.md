@@ -30,3 +30,5 @@ GitHub B-22/ai-quota-monitor 作为同步中心。Windows 仅编辑和操作 Git
 换设备前提交、推送，另一端拉取；同一分支避免两端同时编辑。验证通过才合并 main／发布，源码同步不自动部署。本次迁移分支保留 GitHub 原插件历史；本地私有导入历史不上传，详见 [双设备开发与同步](docs/workflow.md)。
 
 迁移通过保留原 main 祖先的任务分支完成；Go backend 尚未实现。根目录工作流验证 Windows x64 插件，迁移期间不自动发版；子目录旧工作流仅供参考。
+
+整合版本作为 main；原插件版本保留在 legacy/trafficmonitor-original。云端构建仅手动触发，push／PR 不自动构建，也不自动发版。

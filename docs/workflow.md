@@ -27,4 +27,8 @@ Git 和文本检查不替代编译测试。凭据、真实 .env、运行配置�
 
 ## 迁移状态（2026-10-10）
 
-迁移分支 agent/consolidate-sources 从 GitHub 原 main 派生，保留旧提交和标签；整合目录以经过脱敏的快照导入，本地私有导入历史不上传。两端通过 GitHub origin 同步，哆啦保留主工作目录。main 仍是旧版本，待必要验证通过再合并迁移 PR。根目录工作流执行云端 Windows x64 验证，不自动创建标签或发布。
+迁移分支 agent/consolidate-sources 从 GitHub 原 main 派生，保留旧提交和标签；整合目录以经过脱敏的快照导入，本地私有导入历史不上传。两端通过 GitHub origin 同步，哆啦保留主工作目录。整合版本合并到 main；原插件版本保留在 legacy/trafficmonitor-original。根目录工作流执行云端 Windows x64 验证，不自动创建标签或发布。
+
+## 手动构建与通知
+
+默认不在 push 或 PR 时构建。Windows x64 验证工作流仅保留 workflow_dispatch，确需验证时手动运行；仍禁止 Windows 本机 C++／Go 编译测试。GitHub Actions 邮件通知由账户通知设置控制，与工作流触发开关分开管理。
