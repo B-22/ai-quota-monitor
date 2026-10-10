@@ -16,8 +16,8 @@ jobs:
       - uses: actions/checkout@v6
       - name: Configure x64
         run: cmake -S . -B build/x64 -A x64 -DCMAKE_BUILD_TYPE=Release
-      - name: Build plugin and all tests
-        run: cmake --build build/x64 --config Release --target AIUsage CodexUsageTests ProxyHelperTests
+      - name: Build all default targets
+        run: cmake --build build/x64 --config Release
       - name: Test x64
         run: ctest --test-dir build/x64 -C Release --output-on-failure
       - name: Upload validated plugin

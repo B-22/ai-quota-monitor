@@ -35,7 +35,7 @@
 
 Windows 本机禁止 C++／Go 编译、测试、CMake 配置和工具链安装，不通过本机 WSL、Docker 或虚拟机绕过。旧“推送前必须在 Windows 本地完整验证”要求停止适用。
 
-开发分支可先推送待验证代码；合并 main 和发布前必须完成必要验证。C++ 在 GitHub Actions Windows runner 完整配置、构建 AIUsage、CodexUsageTests、ProxyHelperTests 并执行 CTest，至少覆盖 x64，确认零失败；Go 在哆啦验证。结果须对应待合并提交。云端失败先读日志定位，修复后重新验证。部署检查继续适用。同步流程见统一项目 docs/workflow.md。
+开发分支可先推送待验证代码；合并 main 和发布前必须完成必要验证。C++ 在 GitHub Actions Windows runner 完整配置、构建全部默认目标（包含所有测试程序）并执行 CTest，至少覆盖 x64，确认零失败；Go 在哆啦验证。结果须对应待合并提交。云端失败先读日志定位，修复后重新验证。部署检查继续适用。同步流程见统一项目 docs/workflow.md。
 
 ## Git 发布
 
