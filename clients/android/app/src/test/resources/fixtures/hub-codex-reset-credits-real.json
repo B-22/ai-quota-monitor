@@ -1,0 +1,21 @@
+{
+  "limits": {
+    "providers": [
+      {
+        "provider": "codex",
+        "status": "ok",
+        "resetCredits": {
+          "availableCount": 4,
+          "nextExpiresAt": "2026-10-04T05:41:37.555Z",
+          "expirations": [
+            "2026-10-04T05:41:37.555Z",
+            "2026-10-04T23:02:54.217Z",
+            "2026-10-22T21:04:19.308Z",
+            "2026-10-29T19:35:37.228Z"
+          ]
+        },
+        "windows": []
+      }
+    ]
+  }
+}

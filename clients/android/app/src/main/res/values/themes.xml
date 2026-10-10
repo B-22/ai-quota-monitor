@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        A bare platform theme, deliberately without the Material Components XML
+        library: every pixel of this app is drawn by Compose, and pulling in a
+        second theming system to get a "NoActionBar" parent would be dead weight.
+    -->
+    <style name="Theme.TokenMonitor" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

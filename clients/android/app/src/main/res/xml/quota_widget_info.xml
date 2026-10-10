@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    updatePeriodMillis is 30 minutes, which is Android's minimum for a widget's
+    own refresh cadence; the platform silently clamps anything lower. The widget
+    does not fetch in that callback — it re-reads the snapshot the app (or the
+    15-minute WorkManager job) wrote.
+
+    minWidth/minHeight and minResize* declare a 40 dp minimum, not a measured
+    launcher cell. targetCell* requests a 1x1 initial placement on Android 12+.
+    Actual available dimensions are supplied by the host.
+
+    Single-account layouts use SizeMode.Exact and LocalSize, selecting a shape
+    only when its content budget fits. Multi-account content has its own provider.
+    Missing dimensions use a 180x160 dp reference and the same budget calculation;
+    this fallback is not a measured launcher cell size.
+-->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/widget_description"
+    android:initialLayout="@layout/glance_default_loading_layout"
+    android:minWidth="40dp"
+    android:minHeight="40dp"
+    android:minResizeWidth="40dp"
+    android:minResizeHeight="40dp"
+    android:previewLayout="@layout/widget_preview"
+    android:resizeMode="horizontal|vertical"
+    android:targetCellWidth="1"
+    android:targetCellHeight="1"
+    android:updatePeriodMillis="1800000"
+    android:widgetCategory="home_screen" />

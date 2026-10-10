@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    HTTP is permitted because the Hub is legitimately reached over plain HTTP on
+    a trusted LAN or a Tailscale address (`http://100.x.x.x:17321`), and that was
+    an explicit requirement.
+
+    Nothing else is relaxed. There is no custom TrustManager, no user-installed
+    CA anchor and no hostname-verifier override, so certificate validation for
+    every https:// Hub stays exactly as Android intends it. The app warns in the
+    UI whenever the configured URL is http://.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
