@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Backups are off entirely.
+
+    The Hub secret is encrypted with a Keystore key that does not leave the
+    device, so a restored ciphertext would be undecryptable anyway; and the
+    widget snapshot is a derived cache the app can rebuild from the Hub in one
+    request. Nothing in app storage is worth carrying to another device.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="file" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" />
+        <exclude domain="database" />
+        <exclude domain="sharedpref" />
+        <exclude domain="file" />
+    </device-transfer>
+</data-extraction-rules>

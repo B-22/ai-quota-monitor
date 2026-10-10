@@ -1,0 +1,3 @@
+* -text
+# Preserve imported source bytes across Windows/Linux; executable wrapper is LF.
+clients/android/gradlew text eol=lf

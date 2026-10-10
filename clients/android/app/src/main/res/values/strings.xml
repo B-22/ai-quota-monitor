@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Token Monitor</string>
+    <string name="widget_label">AI 额度</string>
+    <string name="widget_description">显示 Token Monitor Hub 返回的 AI 额度</string>
+    <string name="widget_multi_label">AI 额度 · 多账号</string>
+    <string name="widget_multi_description">列出所有账号的额度窗口、重置与到期时间</string>
+</resources>

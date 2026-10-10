@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    updatePeriodMillis is 30 minutes, which is Android's minimum for a widget's
+    own refresh cadence; the platform silently clamps anything lower. The widget
+    does not fetch in that callback — it re-reads the snapshot the app (or the
+    15-minute WorkManager job) wrote.
+
+    This one is the multi-account list: it needs room for whole lines of text, so
+    it starts at 3x2 and cannot be shrunk below 2x2. The single-account widget
+    (`quota_widget_info`) is the one that starts at a single cell.
+
+    previewLayout is required on Android 12+; without it the picker shows a blank
+    card.
+-->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/widget_multi_description"
+    android:initialLayout="@layout/glance_default_loading_layout"
+    android:minWidth="180dp"
+    android:minHeight="110dp"
+    android:minResizeWidth="110dp"
+    android:minResizeHeight="110dp"
+    android:previewLayout="@layout/widget_preview_multi"
+    android:resizeMode="horizontal|vertical"
+    android:targetCellWidth="3"
+    android:targetCellHeight="2"
+    android:updatePeriodMillis="1800000"
+    android:widgetCategory="home_screen" />

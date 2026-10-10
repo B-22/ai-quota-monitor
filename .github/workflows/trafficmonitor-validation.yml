@@ -1,0 +1,30 @@
+name: TrafficMonitor validation
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-plugin:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: clients/trafficmonitor
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure x64
+        run: cmake -S . -B build/x64 -A x64 -DCMAKE_BUILD_TYPE=Release
+      - name: Build plugin and all tests
+        run: cmake --build build/x64 --config Release --target AIUsage CodexUsageTests ProxyHelperTests
+      - name: Test x64
+        run: ctest --test-dir build/x64 -C Release --output-on-failure
+      - name: Upload validated plugin
+        uses: actions/upload-artifact@v6
+        with:
+          name: AIUsage-x64
+          path: |
+            clients/trafficmonitor/build/x64/Release/AIUsagePreview.dll
+            clients/trafficmonitor/AIUsage.ini
+          if-no-files-found: error
