@@ -1,6 +1,6 @@
 # 当前架构决策
 
-状态：2026-10-10 用户确认；尚未实现和切换。
+状态：2026-10-10 用户确认；collector 首期（Desktop 凭据读取 + 只读额度查询）已实现并通过 Linux 单元测试与 Windows 交叉编译，尚未在虚拟机 Desktop 实测；hub 未实现，未切换。
 
 采集设备（虚拟机 Claude Desktop、所在设备的 Codex）→ Go collector → 哆啦 Go hub → TrafficMonitor / 安卓 App 与小组件。
 
@@ -12,7 +12,7 @@ collector / hub 合并为一个 Go 可执行文件，通过启动参数选择模
 Android 当前依赖旧 Hub 的 /api/health、/api/stats、/api/devices 与 /api/stats/stream；Go Hub 优先实现客户端实际需要的兼容字段和帧语义，不重建整个 Token Monitor。
 TrafficMonitor 后续增加 Hub 数据源；当前仍保留旧本机采集行为。安卓小组件继续显示 App 写入的本地快照。
 
-空闲常驻内存 20–30 MiB 是目标，需分别测 Hub、采集端与查询峰值；不是已达到指标。Go Desktop 凭据读取、令牌刷新协调、账号标识、认证、持久化格式、过期判定、接口子集仍待实现与验证。
+空闲常驻内存 20–30 MiB 是目标，需分别测 Hub、采集端与查询峰值；不是已达到指标。Go Desktop 凭据读取已在 collector 实现（尚未在虚拟机 Desktop 实测）；令牌刷新协调、账号标识、认证、持久化格式、过期判定、接口子集仍待实现与验证。
 
 ## 实现选型顺序
 

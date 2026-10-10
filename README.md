@@ -1,13 +1,13 @@
 # AI Quota Monitor
 
-状态：2026-10-10 已完成源码收拢；现有客户端保持原行为，新的 Go 采集端／Hub 尚未实现。
+状态：2026-10-10 已完成源码收拢；现有客户端保持原行为。新的 Go 采集端已开始实现：collector 首期切片（Windows Claude Desktop 凭据读取 + 只读额度查询）已通过 Linux 单元测试与 Windows 交叉编译，尚未在虚拟机 Desktop 实测；Hub 尚未实现。
 
 统一源码主库在哆啦 `<device-local-path>`；Windows 开发副本在
 `<windows-workspace>`。两处使用同一 Git 历史，通过显式提交、fetch、合并同步；不做文件级双向覆盖。
 
 | 目录 | 内容 |
 |---|---|
-| `backend/` | 新 Go 单一可执行文件的设计入口，未来提供 collector / hub 两种模式 |
+| `backend/` | 新 Go 单一可执行文件；collector 首期（Desktop 凭据 + 只读额度查询）已实现，hub 待实现 |
 | `clients/trafficmonitor/` | 当前 Windows C++ 插件完整工作树，包括此次导入的未提交改动 |
 | `clients/android/` | 当前 Kotlin Android App、小组件、Gradle wrapper 与单元测试 |
 | `deploy/` | 部署约定入口；真实配置与凭据继续留在运行设备 |
