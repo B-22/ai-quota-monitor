@@ -79,3 +79,9 @@
 4. 首个验证点是虚拟机 Desktop 凭据格式与只读额度查询；不要先扩展 Hub、UI 或历史统计。实现后再做真实内存基线和峰值测量。
 
 本次只做搜索、源码核验和维护规则更新，没有运行候选安装脚本、访问用户 Provider 凭据、调用真实额度接口或切换现有服务。
+
+## TrafficMonitor Hub 读取适配（2026-10-13）
+
+先核查本仓库 `JsonLite`、时间解析、WinHTTP fetcher、Claude/Codex 数据模型和现有绘制，全部复用。GitHub 搜索 TrafficMonitor quota/Hub 客户端后实际核查 `HCLonely/TrafficMonitor_Codex_Plugin` 固定提交 `cc1953d37bf98999601dcc91f3b12bea6e66ee8b`：MIT，`src/CodexUsageFetcher.cpp` 使用 WinHTTP session/connect/read，`JsonLite` 与 core 解析已在本工程继承，无额外依赖；该上游没有本项目 `/api/stats` 聚合数据读取能力。因此仅补 Hub 协议适配和 Bearer/URL 安全边界，保留现有显示及其他 Provider。未复制额外外部源码；MinGW-w64 来自 Debian 官方包，使用既有 WinHTTP/Direct2D 系统 API。
+
+Hub 适配选择 provider 行采集时间而非总更新时间，保留 unknown/0/stale 区分；补充 Credits/订阅/重置卡缺口显示未知，不造兼容服务。

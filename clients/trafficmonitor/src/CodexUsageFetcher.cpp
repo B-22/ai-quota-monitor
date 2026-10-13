@@ -3,7 +3,7 @@
 #include "JsonLite.h"
 #include "ProxyHelper.h"
 
-#include <Windows.h>
+#include <windows.h>
 #include <winhttp.h>
 
 #include <algorithm>

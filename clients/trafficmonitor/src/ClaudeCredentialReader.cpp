@@ -2,7 +2,7 @@
 #include "DpapiHelper.h"
 #include "JsonLite.h"
 
-#include <Windows.h>
+#include <windows.h>
 
 #include <chrono>
 #include <fstream>

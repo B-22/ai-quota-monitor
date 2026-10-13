@@ -1,4 +1,5 @@
 #include "CodexUsageFetcher.h"
+#include "HubUsageFetcher.h"
 #include "ClaudeUsageFetcher.h"
 #include "ClaudeUsageExport.h"
 #include "AntigravityUsageFetcher.h"
@@ -13,7 +14,7 @@
 
 #include "PluginInterface.h"
 
-#include <Windows.h>
+#include <windows.h>
 #include <ole2.h>
 #include <gdiplus.h>
 
@@ -632,6 +633,8 @@ struct DashData {
     double lastCodexOk = 0;
     bool claudeAvailable = false;
     bool codexAvailable = false;
+    bool claudeHubSource = false;
+    bool codexHubSource = false;
     bool refreshInProgress = false;
     bool resetCreditsAvailable = false;
     int resetCreditCount = 0;
@@ -695,6 +698,7 @@ bool ShouldShowOrBalance(const PluginOptions& opts, const DashData& data) {
 }
 
 std::wstring FormatCredits(const DashData& data) {
+    if (data.claudeHubSource) return L"--";
     if (!data.claudeAvailable) return L"--";
     const int decimalPlaces = std::clamp(data.decPlaces, 0, 9);
     const double amount = data.usedCredits / pow(10.0, decimalPlaces);
@@ -1851,10 +1855,21 @@ public:
             auto markDone = [&]() {
                 workerExited_.store(true);
             };
-            auto claude = claude_.Fetch();
+            const HubConfig& hubConfig = hub_.Config();
+            const auto hub = hub_.Fetch();
+            if (stop_.load()) { FinishFetch(); markDone(); return; }
+            const bool claudeFromHub = hub.claude.has_value();
+            const bool codexFromHub = hub.codex.has_value();
+            const bool allowClaudeLocal = !hubConfig.enabled
+                || (hubConfig.localFallback && hubConfig.localFallbackClaude);
+            const bool allowCodexLocal = !hubConfig.enabled
+                || (hubConfig.localFallback && hubConfig.localFallbackCodex);
+            auto claude = SelectHubOrLocal(hub.claude, hubConfig,
+                hubConfig.localFallbackClaude, [this] { return claude_.Fetch(); });
             if (stop_.load()) { FinishFetch(); markDone(); return; }
             MaybeExportClaudeUsage(claude);
-            auto codex = codex_.Fetch();
+            auto codex = SelectHubOrLocal(hub.codex, hubConfig,
+                hubConfig.localFallbackCodex, [this] { return codex_.Fetch(); });
             if (stop_.load()) { FinishFetch(); markDone(); return; }
             auto ag = ag_.Fetch();
             if (stop_.load()) { FinishFetch(); markDone(); return; }
@@ -1879,6 +1894,7 @@ public:
                 d.decPlaces = claude.decimalPlaces;
                 d.subStatus = claude.subscriptionStatus;
                 d.claudeAvailable = true;
+                d.claudeHubSource = claudeFromHub;
                 d.lastClaudeOk = claude.lastSuccessTime > 0 ? claude.lastSuccessTime : t;
             }
             if (codex.success) {
@@ -1896,7 +1912,40 @@ public:
                 }
                 if (hasCodexUsage) {
                     d.codexAvailable = true;
-                    d.lastCodexOk = t;
+                    d.lastCodexOk = codexFromHub ? static_cast<double>(hub.codexCollectedAt) : t;
+                    d.codexHubSource = codexFromHub;
+                }
+            }
+            if (codexFromHub) {
+                // Missing windows remain unknown, rather than retaining another account's quota.
+                d.x5 = codex.fiveHour.usedPercent;
+                d.x7 = codex.weekly.usedPercent;
+                d.x7ResetUnix = codex.weekly.resetAtUnixSeconds;
+            }
+            if (codexFromHub || (hubConfig.enabled && !allowCodexLocal)) {
+                d.codexHubSource = true;
+                // The current Hub contract has no reset-card/radar metadata.
+                d.resetCreditsAvailable = false;
+                d.resetCreditCount = 0;
+                d.resetCreditExpiryUnix = 0;
+                d.resetRadarWindowOpen = false;
+                d.resetProbability24h = d.resetProbability48h = -1;
+                d.resetRadarUpdatedUnix = 0;
+            }
+            if (hubConfig.enabled) {
+                if (!allowClaudeLocal) {
+                    d.claudeHubSource = true;
+                    d.subStatus.clear();
+                }
+                if (!claudeFromHub && !allowClaudeLocal) {
+                    d.c5 = d.c7 = d.cFable = -1;
+                    d.claudeAvailable = false;
+                    d.c5Reset.clear(); d.c7Reset.clear(); d.cFableReset.clear();
+                }
+                if (!codexFromHub && !allowCodexLocal) {
+                    d.x5 = d.x7 = -1;
+                    d.codexAvailable = false;
+                    d.x7ResetUnix = 0;
                 }
             }
             if (codex.resetCredits.success) {
@@ -2007,6 +2056,15 @@ public:
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 tip_ = BuildTip(claude, codex, ag, kiro, go, router);
+                if (hubConfig.enabled) {
+                    tip_ += L"\nHub Claude: ";
+                    tip_ += claudeFromHub ? L"Hub" : allowClaudeLocal ? L"local fallback" : L"unavailable";
+                    tip_ += L" | Codex: ";
+                    tip_ += codexFromHub ? L"Hub" : allowCodexLocal ? L"local fallback" : L"unavailable";
+                    if (claudeFromHub || codexFromHub)
+                        tip_ += L"\nHub: Credits/subscription/reset cards/radar unavailable";
+                    tip_ = TruncateTooltip(tip_, dash_.GetOptions().tooltipMaxChars);
+                }
             }
             FinishFetch();
             markDone();
@@ -2602,6 +2660,21 @@ private:
             L"AIUsage", L"VerifyTargetHostExitIp", L"1",
             buf, 1024, iniPath.c_str());
         proxyConfig_.verifyTargetHost = (buf[0] != L'0');
+        HubConfig hubConfig;
+        hubConfig.enabled = GetPrivateProfileIntW(L"Hub", L"Enabled", 0, iniPath.c_str()) != 0;
+        hubConfig.localFallback = GetPrivateProfileIntW(L"Hub", L"LocalFallback", 1, iniPath.c_str()) != 0;
+        hubConfig.localFallbackClaude = GetPrivateProfileIntW(L"Hub", L"LocalFallbackClaude", 0, iniPath.c_str()) != 0;
+        hubConfig.localFallbackCodex = GetPrivateProfileIntW(L"Hub", L"LocalFallbackCodex", 0, iniPath.c_str()) != 0;
+        wchar_t hubBuf[4096]{};
+        GetPrivateProfileStringW(L"Hub", L"Url", L"", hubBuf, 4096, iniPath.c_str());
+        hubConfig.url = TrimCopy(hubBuf);
+        GetPrivateProfileStringW(L"Hub", L"Token", L"", hubBuf, 4096, iniPath.c_str());
+        hubConfig.token = TrimCopy(hubBuf);
+        GetPrivateProfileStringW(L"Hub", L"ClaudeAccountKey", L"", hubBuf, 4096, iniPath.c_str());
+        hubConfig.claudeAccountKey = WideToUtf8(TrimCopy(hubBuf));
+        GetPrivateProfileStringW(L"Hub", L"CodexAccountKey", L"", hubBuf, 4096, iniPath.c_str());
+        hubConfig.codexAccountKey = WideToUtf8(TrimCopy(hubBuf));
+        hub_.SetConfig(std::move(hubConfig));
         claude_.SetProxyConfig(proxyConfig_);
         codex_.SetProxyConfig(proxyConfig_);
         codex_.SetRadarEnabled(o.showResetRadar);
@@ -3222,6 +3295,7 @@ private:
     agentstatus::LightOptions lightOpts_;
     std::wstring statusTip_;
     ClaudeUsageFetcher claude_;
+    HubUsageFetcher hub_;
     CodexUsageFetcher codex_;
     AntigravityUsageFetcher ag_;
     KiroCreditsFetcher kiro_;

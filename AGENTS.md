@@ -1,3 +1,4 @@
+<!-- 2026-10-13: 本轮用户要求优先，禁止 GitHub Actions；C++ 改在哆啦 MinGW 交叉构建，Windows 仅部署运行。 -->
 # AI Quota Monitor 协作规范
 
 适用范围：本统一项目。用户已确认哆啦为源码主库、Windows 为开发副本；未来架构为一个 Go 可执行文件的 collector/hub 两种模式，加 TrafficMonitor 和安卓显示端。
@@ -9,7 +10,7 @@
 - 同账号的账户额度选择最新有效上报，不累加百分比；未知、零、失效和离线分开处理。
 - 所有架构、配置、接口和公开行为变更同步 README 和对应主文档。docs/reference 是历史／固定版本证据，不得当作当前运行状态。
 - backend 当前仅有设计说明，不得将未实现的 Go 服务或 20–30 MiB 目标写成已验证结果。
-- Windows 本机禁止 C++／Go 编译、测试、CMake 配置及工具链安装，只编辑、审阅和操作 Git；不通过本机 Docker、WSL 或虚拟机绕过。Go／Android 在哆啦验证，C++ 在 GitHub Actions Windows runner 验证。
+- Windows 本机禁止 C++／Go 编译、测试、CMake 配置及工具链安装，只编辑、审阅和操作 Git；不通过本机 Docker、WSL 或虚拟机绕过。Go／Android 在哆啦验证，C++ 在哆啦 MinGW-w64 x64 交叉编译，禁止 GitHub Actions。
 - clients/trafficmonitor 沿用部署检查；旧推送前 Windows 本地验证要求由用户约束替换。任务分支可先推送待验证代码，必要验证通过才合并 main／发布；不复用旧绝对路径构建缓存。
 - clients/android 沿用其 AGENTS.md。先核对接口契约，真实测试响应先脱敏。
 - .local 是本机导入与审计资料，不跟踪。真实 .env、SDK 配置、运行配置、密钥、日志和生成产物不得入库。
@@ -19,4 +20,4 @@
 
 新增模块或重要能力之前，先查项目已有实现，并在 GitHub 搜索现成能力；看实际源码、固定提交、许可证和依赖，不仅看 README。复用判断记录在 `docs/reuse-survey.md`。优先已有代码、标准库和成熟开源模块，仅为已确认的缺口写必要适配；不得直接从零重写已存在的采集、系统加解密、显示或小组件缓存。未实测的资源指标保持为目标。
 
-- 默认不自动构建：工作流仅手动触发，不新增 push／PR／定时构建触发器。需要验证时显式手动运行云端工作流；账户 Actions 邮件设置与构建触发器分别管理。
+- 默认不自动构建：工作流仅手动触发，不新增 push／PR／定时构建触发器。用户于 2026-10-13 禁止 GitHub Actions，改在哆啦交叉构建验证；账户 Actions 邮件设置与构建触发器分别管理。

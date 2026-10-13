@@ -7,7 +7,7 @@
 //     TrafficMonitor hands out anything from a half row to a full one.
 #include "AgentLightItems.h"
 
-#include <Windows.h>
+#include <windows.h>
 
 #include <iostream>
 #include <string>
@@ -165,9 +165,11 @@ int main() {
         const int right = s.InkRight();
         Expect(right >= 0, "The group must actually draw something");
         Expect(right <= 10 + static_cast<int>(measured),
-            "Drawn ink must stay within the measured width");
+            "Drawn ink must stay within the measured width (right="
+                + std::to_string(right) + ", width=" + std::to_string(measured) + ")");
         Expect(s.InkLeft() >= 10,
-            "The group must not draw left of its origin");
+            "The group must not draw left of its origin (left="
+                + std::to_string(s.InkLeft()) + ")");
     }
 
     // ---- Scaling with the slot height ----

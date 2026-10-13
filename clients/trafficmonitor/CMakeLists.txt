@@ -1,12 +1,17 @@
 cmake_minimum_required(VERSION 3.21)
 
-set(CODEX_USAGE_VERSION "0.6.0" CACHE STRING "AIUsage plugin version")
+set(CODEX_USAGE_VERSION "0.7.0" CACHE STRING "AIUsage plugin version")
 
 project(AIUsage VERSION "${CODEX_USAGE_VERSION}" LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(MINGW)
+    add_compile_options(-finput-charset=UTF-8 -fexec-charset=UTF-8)
+    add_compile_definitions(_WIN32_WINNT=0x0A00)
+endif()
 
 # Use static MSVC runtime
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -39,6 +44,7 @@ add_library(AIUsageCore STATIC
     src/ClaudeUsageExport.cpp
     src/ClaudeUsageParser.cpp
     src/JsonLite.cpp
+    src/HubUsageParser.cpp
 )
 
 target_include_directories(AIUsageCore PUBLIC
@@ -60,6 +66,7 @@ endif()
 # DLL: plugin + Claude/Codex/Antigravity/Kiro/OpenCode-Go/OpenRouter fetchers + DPAPI + credential reader
 add_library(AIUsage SHARED
     src/CodexUsagePlugin.cpp
+    src/HubUsageFetcher.cpp
     src/DashboardRenderer.cpp
     src/CodexUsageFetcher.cpp
     src/ClaudeUsageFetcher.cpp
@@ -102,6 +109,8 @@ target_link_libraries(AIUsage PRIVATE
     gdiplus
     d2d1
     dwrite
+    ole32
+    uuid
 )
 
 set_target_properties(AIUsage PROPERTIES
@@ -122,6 +131,13 @@ endif()
 
 enable_testing()
 add_test(NAME CodexUsageTests COMMAND CodexUsageTests)
+
+add_executable(HubUsageTests tests/HubUsageTests.cpp)
+target_link_libraries(HubUsageTests PRIVATE AIUsageCore)
+if(MSVC)
+    target_compile_options(HubUsageTests PRIVATE /utf-8)
+endif()
+add_test(NAME HubUsageTests COMMAND HubUsageTests)
 
 # Cowork / Code indicator-light state machine. Filesystem-free by design:
 # the aggregation rule and the two log parsers are pure functions.

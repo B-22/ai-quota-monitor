@@ -1,3 +1,4 @@
+<!-- 2026-10-13: 本轮用户要求优先，禁止 GitHub Actions；C++ 改在哆啦 MinGW 交叉构建，Windows 仅部署运行。 -->
 # TrafficMonitor-AIUsage 协作规范
 
 本文件适用于仓库内的人工协作与自动化代理。
@@ -35,7 +36,7 @@
 
 Windows 本机禁止 C++／Go 编译、测试、CMake 配置和工具链安装，不通过本机 WSL、Docker 或虚拟机绕过。旧“推送前必须在 Windows 本地完整验证”要求停止适用。
 
-开发分支可先推送待验证代码；合并 main 和发布前必须完成必要验证。C++ 在 GitHub Actions Windows runner 完整配置、构建全部默认目标（包含所有测试程序）并执行 CTest，至少覆盖 x64，确认零失败；Go 在哆啦验证。结果须对应待合并提交。云端失败先读日志定位，修复后重新验证。部署检查继续适用。同步流程见统一项目 docs/workflow.md。
+开发分支可先推送待验证代码；合并 main 和发布前必须完成必要验证。用户于 2026-10-13 明确要求停止 GitHub Actions。C++ 在哆啦使用 MinGW-w64 完整交叉配置、构建全部默认目标（DLL 和所有测试 EXE），至少覆盖 x64；有 Wine 时执行 CTest，没有 Wine 时明确运行测试限制并在 Windows 宿主机验证真实加载与 Hub 数据。Windows 宿主机仅部署运行，不编译。Go 在哆啦验证。结果须对应提交。部署检查继续适用。同步流程见统一项目 docs/workflow.md。
 
 ## Git 发布
 

@@ -10,7 +10,7 @@
 // the moment a session starts. The Cowork light is permanent and shows a grey
 // dot when nothing is running.
 
-#include <Windows.h>
+#include <windows.h>
 
 #include <mutex>
 #include <string>

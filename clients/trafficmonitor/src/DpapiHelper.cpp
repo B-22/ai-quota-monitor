@@ -1,7 +1,7 @@
 #include "DpapiHelper.h"
 #include "CodexUsageCore.h"
 
-#include <Windows.h>
+#include <windows.h>
 #include <wincrypt.h>
 #include <bcrypt.h>
 

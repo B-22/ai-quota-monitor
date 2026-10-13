@@ -1,7 +1,7 @@
 #include "AgentStatusWatcher.h"
 
 
-#include <Windows.h>
+#include <windows.h>
 
 #include <iostream>
 #include <string>

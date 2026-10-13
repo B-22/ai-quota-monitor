@@ -2,7 +2,7 @@
 
 #include "JsonLite.h"
 
-#include <Windows.h>
+#include <windows.h>
 
 #include <algorithm>
 #include <chrono>

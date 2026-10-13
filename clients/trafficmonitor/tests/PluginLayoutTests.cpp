@@ -18,7 +18,7 @@
 // The DLL path arrives as argv[1] (CMake passes $<TARGET_FILE:AIUsage>).
 #include "PluginInterface.h"
 
-#include <Windows.h>
+#include <windows.h>
 
 #include <iostream>
 #include <string>

@@ -614,7 +614,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 产物：`build/Release/AIUsagePreview.dll`
 
-GitHub Actions 发版（tag `v*` / main 推送）自动附带以下产物：
+历史 GitHub Actions 发版曾附带以下产物；统一仓库现仅保留手动工作流，2026-10-13 起按用户要求不触发 Actions，改在哆啦交叉构建：
 - `AIUsage-{x86,x64,arm64}.zip`：插件 DLL + `AIUsage.ini` 模板
 - `aiusage-server-linux-amd64` / `aiusage-server-linux-arm64`：Go 转发服务
   （静态二进制，部署到 Linux 服务器直接运行）
@@ -742,3 +742,38 @@ docs/
 ## 许可证
 
 MIT License
+
+## 自建 Go Hub 数据源
+
+插件新增可选 `[Hub]` 配置，默认 `Enabled=0`，原本所有显示及采集设置继续生效。配置 `Enabled=1`、`Url=https://hub.example.com` 和本机 `Token` 后，后台刷新通过带 Bearer 认证的 `GET /api/stats` 读取脱敏额度。插件不上传 Provider 凭据。Hub HTTP 会话使用系统网络/代理，独立于官方 API 的出口白名单设置；远端要求有效 HTTPS，HTTP 仅允许 localhost/127.0.0.1/::1，拒绝 URL 用户密码、查询参数及重定向。错误提示不包含地址、令牌或响应体。
+
+Hub启用时 `LocalFallbackClaude=0`、`LocalFallbackCodex=0` 为默认值：显示端不读取 Claude/Codex 登录态、不请求 Anthropic/OpenAI 官方额度。Hub缺失、过期、失败或额度未知时显示未知，Claude不会因缺数据自动转为宿主机采集。只有同时设置总开关 `LocalFallback=1` 与对应的 provider 回退开关为 `1`，才允许调用原本本地 fetcher；Hub新鲜有效时仍不调用。生产显示端保持两provider开关为 `0`，由凭据所在设备的collector上传。禁用Hub（`Enabled=0`）则恢复原插件采集行为。Antigravity、Kiro、OpenCode Go、OpenRouter、状态灯等保持原逻辑。
+
+Hub 行的 `updatedAt` 是采集时间，新鲜度不取总响应 `updatedAt`；按行 `stale` 和 `staleAfterMs` 拒绝过期数据。`usedPercent:null` 与明确 `0` 分开，缺失窗口显示未知。多个账号不累加百分比，默认选择每个 provider 采集时间最新的有效行；可设置 `ClaudeAccountKey` / `CodexAccountKey` 精确选择匿名账号。
+
+当前 Hub 协议只提供额度窗口和重置时间，不提供 Claude Credits/订阅状态、Codex 重置卡/雷达。Hub 模式下这些补充数据标为未知或隐藏，缺失补充数据不触发本地回退；本地回退成功后按原方式显示。自定义订阅到期日期仍是用户本地配置。Hub token 不出现在 tooltip、日志、导出或仓库模板中。
+
+## 本轮构建规则（2026-10-13）
+
+用户要求停止使用 GitHub Actions：私有库不触发云端构建，不在 Windows 宿主机编译/测试/安装工具链。插件在哆啦使用 Debian 官方 MinGW-w64 x64 POSIX 交叉编译；构建全部默认目标（DLL 与全部测试 EXE）。若哆啦有 Wine，则用 Wine 执行 CTest；没有 Wine 时须明确测试程序只完成编译，部署后实测插件加载和 Hub 数据源，不能声称 CTest 已通过。既有手动 Actions 工作流保留为历史配置，本轮不触发。
+
+```sh
+cmake -S clients/trafficmonitor -B /cache/ai-quota-monitor-plugin-build \
+  -G Ninja -DCMAKE_TOOLCHAIN_FILE="$PWD/clients/trafficmonitor/cmake/mingw-x64.cmake" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build /cache/ai-quota-monitor-plugin-build
+```
+
+MinGW 产物静态链接 C++/GCC/POSIX 运行库，部署不额外复制编译器 DLL。运行目录仍使用既有 AIUsage.ini，不以模板覆盖本机配置。
+
+Wine测试使用 `/cache` 下独立prefix与合成样本（不读取真实Provider登录态）：
+
+```sh
+chmod +x clients/trafficmonitor/cmake/wine-test-wrapper.sh
+cmake -S clients/trafficmonitor -B /cache/ai-quota-monitor-plugin-build \
+  -DCMAKE_CROSSCOMPILING_EMULATOR="$PWD/clients/trafficmonitor/cmake/wine-test-wrapper.sh"
+WINEPREFIX=/cache/ai-quota-monitor-plugin-wine xvfb-run -a \
+  ctest --test-dir /cache/ai-quota-monitor-plugin-build --output-on-failure --timeout 60
+```
+
+交叉DLL入口为 `TMPluginGetInstance`；公开接口无跨边界STL或虚析构，x64调用约定一致，仍需在真实TrafficMonitor宿主机验证加载。MinGW/Wine结果不代替宿主机渲染和MSVC接口实测。
